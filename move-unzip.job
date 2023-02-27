@@ -1,0 +1,11 @@
+#!/bin/bash
+#SBATCH --job-name=move-unzip
+#SBATCH --chdir=/proj/jola
+#SBATCH -M ukko
+#SBATCH -o result-%j.txt
+#SBATCH -c 1
+#SBATCH -t 60:00
+#SBATCH --mem-per-cpu=1G
+
+mv experiments/dataset/01_images.zip /wrk/users/jola/dataset/gtav/01_images.zip
+unzip /wrk/users/jola/dataset/gtav/01_images.zip -d /wrk/users/jola/dataset/gtav/

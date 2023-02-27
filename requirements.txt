@@ -1,0 +1,6 @@
+torch==1.13.1
+torchvision==0.14.1
+torchmetrics==0.11.1
+numpy==1.24.1
+jupyter==1.0.0
+matplotlib==3.7.0

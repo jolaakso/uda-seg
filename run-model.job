@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --job-name=run-model
+#SBATCH --chdir=/proj/jola/experiments
+#SBATCH -M ukko
+#SBATCH -o batchlogs/result-model-%j.txt
+#SBATCH -p gpu
+#SBATCH -c 2
+#SBATCH --constraint=a100
+#SBATCH --gres=gpu:1
+#SBATCH --mem-per-cpu=5G
+
+echo 'starting workload'
+source venv/bin/activate
+python -u mainloop.py --dataset /wrk/users/jola/dataset/gtav/ --adaptset /wrk/users/jola/dataset/cityscapes/ --save /wrk/users/jola/results/rn50-batch2-adapt.torch --device cuda
