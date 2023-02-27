@@ -13,7 +13,7 @@ import random
 
 BATCH_SIZE = 2
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 10
+EPOCH_COUNT = 7
 
 class USSegLoss(nn.Module):
     def __init__(self, weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to('cpu'), overlap_ratio=0.1):
@@ -26,21 +26,6 @@ class USSegLoss(nn.Module):
 
     def forward(self, source):
         target_populated_channels = self.overlap_ratio / float(source.shape[1])
-
-        v_masks = torch.ones_like(source)
-        h_masks = v_masks.sum(dim=2, keepdim=True) / float(source.shape[3] * source.shape[2])
-        h_masks = 2*h_masks.cumsum(dim=3) - 1
-        v_masks = v_masks.sum(dim=3, keepdim=True) / float(source.shape[3] * source.shape[2])
-        v_masks = 2*v_masks.cumsum(dim=2) - 1
-        #print(v_masks.shape)
-        #print(h_masks.shape)
-        v_dist = torch.softmax(source.sum(dim=3, keepdim=True), dim=2)
-        h_dist = torch.softmax(source.sum(dim=2, keepdim=True), dim=3)
-        v_vars = torch.sqrt(torch.var((v_dist * v_masks), dim=2))
-        h_vars = torch.sqrt(torch.var((h_dist * h_masks), dim=3))
-
-        #chunked?
-        spreads = v_vars.mean() + h_vars.mean()
 
         sparcity = -torch.square(torch.square(source - 0.5).mean())
 
@@ -85,15 +70,32 @@ class USSegLoss(nn.Module):
         channel_population_dist = torch.square(channel_population - limits).mean()
         chunks = torch.chunk(source, self.split, dim=1)
         vars = []
+        spread_amounts = []
         for c in chunks:
+            v_masks = torch.ones_like(c)
+            h_masks = v_masks.sum(dim=2, keepdim=True) / float(c.shape[3] * c.shape[2])
+            h_masks = 2*h_masks.cumsum(dim=3) - 1
+            v_masks = v_masks.sum(dim=3, keepdim=True) / float(c.shape[3] * c.shape[2])
+            v_masks = 2*v_masks.cumsum(dim=2) - 1
+            #print(v_masks.shape)
+            #print(h_masks.shape)
+            v_dist = torch.softmax(c.sum(dim=3, keepdim=True), dim=2)
+            h_dist = torch.softmax(c.sum(dim=2, keepdim=True), dim=3)
+            v_mean = torch.sum(v_dist * v_masks, dim=2)
+            h_mean = torch.sum(h_dist * h_masks, dim=3)
+            means = torch.cat((v_mean, h_mean), 2)
+            spread_amounts.append(torch.cdist(means, means, p=2).mean(dim=1, keepdim=True))
+            #v_vars = torch.sqrt(torch.var((v_dist * v_masks), dim=2))
+            #h_vars = torch.sqrt(torch.var((h_dist * h_masks), dim=3))
+
+            #spreads = v_vars.mean() + h_vars.mean()
             #print(torch.flatten(c.mean(dim=1), start_dim=1).shape)
             vars.append(torch.var(torch.flatten(c.mean(dim=1), start_dim=1), dim=1, keepdim=True))
             #print(torch.flatten(torch.prod(c, dim=1, keepdim=True), start_dim=1).mean(dim=1, keepdim=True).shape)
             #print(c[0][0:20])
         #print(vars[0].shape)
         variance = torch.cat(vars, 1).mean()
-        #print(variance)
-        #normalizeds = nonnegatives / maxs
+        spreads = -torch.cat(spread_amounts, 1).mean()
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
