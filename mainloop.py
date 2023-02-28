@@ -58,19 +58,21 @@ class USSegLoss(nn.Module):
         #expected_vals = nn.functional.softmax(torch.flatten(source, start_dim=2), dim=2) * torch.flatten(loc_masks, start_dim=2)
         #expected_vals = expected_vals.sum(dim=2, keepdim=True)
 
-        channel_population = source.mean(dim=3).mean(dim=2)
-        limits = torch.ones_like(channel_population) / float(channel_population.shape[1])
-        limits = (limits.cumsum(dim=1) * 0.4) + 0.05
+        #channel_population = source.mean(dim=3).mean(dim=2)
+        #limits = torch.ones_like(channel_population) / float(channel_population.shape[1])
+        #limits = (limits.cumsum(dim=1) * 0.4) + 0.05
         #print(channel_population.shape)
         #print(limits[0][0])
         #print(limits[0][-1])
         #print(limits.shape)
         #print(channel_population[0][0:100] - self.overlap_ratio)
         #print(torch.flatten(source.mean(dim=1), start_dim=1).shape)
-        channel_population_dist = torch.square(channel_population - limits).mean()
+        #channel_population_dist = torch.abs(channel_population - limits).mean()
         chunks = torch.chunk(source, self.split, dim=1)
         vars = []
         spread_amounts = []
+        pop_dists = []
+        count = 0.0
         for c in chunks:
             v_masks = torch.ones_like(c)
             h_masks = v_masks.sum(dim=2, keepdim=True) / float(c.shape[3] * c.shape[2])
@@ -84,18 +86,22 @@ class USSegLoss(nn.Module):
             v_mean = torch.sum(v_dist * v_masks, dim=2)
             h_mean = torch.sum(h_dist * h_masks, dim=3)
             means = torch.cat((v_mean, h_mean), 2)
-            spread_amounts.append(torch.cdist(means, means, p=2).mean(dim=1, keepdim=True))
-            #v_vars = torch.sqrt(torch.var((v_dist * v_masks), dim=2))
-            #h_vars = torch.sqrt(torch.var((h_dist * h_masks), dim=3))
+            spread_amounts.append(torch.var(means, dim=1, keepdim=True))
 
             #spreads = v_vars.mean() + h_vars.mean()
             #print(torch.flatten(c.mean(dim=1), start_dim=1).shape)
-            vars.append(torch.var(torch.flatten(c.mean(dim=1), start_dim=1), dim=1, keepdim=True))
+            flattened = torch.flatten(c, start_dim=2)
+            #spread_amounts.append(torch.cdist(flattened, flattened, p=2).mean(dim=1, keepdim=True))
+            vars.append(torch.var(flattened.mean(dim=1), dim=1, keepdim=True))
+            pop_dists.append(torch.abs(flattened.mean(dim=2).mean(dim=1, keepdim=True) - ((0.3 / self.split) * count + 0.05)))
             #print(torch.flatten(torch.prod(c, dim=1, keepdim=True), start_dim=1).mean(dim=1, keepdim=True).shape)
             #print(c[0][0:20])
+            count += 1.0
         #print(vars[0].shape)
         variance = torch.cat(vars, 1).mean()
         spreads = -torch.cat(spread_amounts, 1).mean()
+        print(pop_dists)
+        channel_population_dist = torch.cat(pop_dists, 1).mean()
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
@@ -103,7 +109,7 @@ class USSegLoss(nn.Module):
         if random.randrange(700) == 0:
             print(f'dist: {channel_population_dist}, variance: {variance}, spreads: {spreads}, sparcity: {sparcity}')
 
-        return channel_population_dist + variance + spreads + sparcity
+        return channel_population_dist + spreads + variance + sparcity
 
 def pixel_accuracy(predictions, batch_labels):
     # Assumes softmax input images
