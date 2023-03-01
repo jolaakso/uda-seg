@@ -45,6 +45,8 @@ class USSegLoss(nn.Module):
         #dog = torch.square(dog.mean())
         #dog = 0
 
+        channel_vars = -torch.var(torch.flatten(source, start_dim=2), dim=1).mean()
+
         #absolutes = torch.abs(source)
 
         # L1
@@ -72,6 +74,7 @@ class USSegLoss(nn.Module):
         vars = []
         spread_amounts = []
         pop_dists = []
+        limitations = []
         count = 0.0
         for c in chunks:
             v_masks = torch.ones_like(c)
@@ -94,14 +97,15 @@ class USSegLoss(nn.Module):
             #spread_amounts.append(torch.cdist(flattened, flattened, p=2).mean(dim=1, keepdim=True))
             vars.append(torch.var(flattened.mean(dim=1), dim=1, keepdim=True))
             pop_dists.append(torch.abs(flattened.mean(dim=2).mean(dim=1, keepdim=True) - ((0.3 / self.split) * count + 0.05)))
+            limitations.append(torch.relu(flattened.mean(dim=2) - ((0.3 / self.split) * count + 0.05)).mean(dim=1, keepdim=True))
             #print(torch.flatten(torch.prod(c, dim=1, keepdim=True), start_dim=1).mean(dim=1, keepdim=True).shape)
             #print(c[0][0:20])
             count += 1.0
         #print(vars[0].shape)
         variance = torch.cat(vars, 1).mean()
         spreads = -torch.cat(spread_amounts, 1).mean()
-        print(pop_dists)
         channel_population_dist = torch.cat(pop_dists, 1).mean()
+        limited = torch.cat(limitations, 1).mean()
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
@@ -109,7 +113,7 @@ class USSegLoss(nn.Module):
         if random.randrange(700) == 0:
             print(f'dist: {channel_population_dist}, variance: {variance}, spreads: {spreads}, sparcity: {sparcity}')
 
-        return channel_population_dist + spreads + variance + sparcity
+        return channel_population_dist + variance + sparcity + limited + channel_vars
 
 def pixel_accuracy(predictions, batch_labels):
     # Assumes softmax input images
