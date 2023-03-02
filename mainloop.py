@@ -23,97 +23,24 @@ class USSegLoss(nn.Module):
         self.weights = weights
         self.overlap_ratio = overlap_ratio
         self.split = 16
+        self.occupancy = 0.3
+        self.variability = 0.07
+        self.saturation = 0.007
 
     def forward(self, source):
-        target_populated_channels = self.overlap_ratio / float(source.shape[1])
-
-        sparcity = -torch.square(torch.square(source - 0.5).mean())
-
-        #loc_means = torch.cat(((v_dist * v_masks).mean(dim=2), (h_dist * h_masks).mean(dim=3)), 2)
-        #loc_chunks = torch.chunk(loc_means, 16, dim=1)
-        #loc_vars = []
-        #for c in loc_chunks:
-            #print(torch.flatten(c.mean(dim=1), start_dim=1).shape)
-        #    loc_vars.append(torch.var(c.mean(dim=2), dim=1, keepdim=True))
-            #print(torch.flatten(torch.prod(c, dim=1, keepdim=True), start_dim=1).mean(dim=1, keepdim=True).shape)
-            #print(c[0][0:20])
-
-        #loc_variance = -torch.cat(loc_vars, 1).mean()
-
-        # Non-smoothness
-        #dog = nn.functional.relu(self.wide_gaussian(source) - self.narrow_gaussian(source))
-        #dog = torch.square(dog.mean())
-        #dog = 0
-
-        channel_vars = -torch.var(torch.flatten(source, start_dim=2), dim=1).mean()
-
-        #absolutes = torch.abs(source)
-
-        # L1
-        #manhattan = absolutes.mean()
-        #manhattan = 0
-
-        # Deviance_from_target
-        #mean_channels = source.mean(dim=3).mean(dim=2)
-        #deviance = torch.square(mean_channels - (torch.ones_like(mean_channels) * self.overlap_ratio)).mean()
-
-        #expected_vals = nn.functional.softmax(torch.flatten(source, start_dim=2), dim=2) * torch.flatten(loc_masks, start_dim=2)
-        #expected_vals = expected_vals.sum(dim=2, keepdim=True)
-
-        #channel_population = source.mean(dim=3).mean(dim=2)
-        #limits = torch.ones_like(channel_population) / float(channel_population.shape[1])
-        #limits = (limits.cumsum(dim=1) * 0.4) + 0.05
-        #print(channel_population.shape)
-        #print(limits[0][0])
-        #print(limits[0][-1])
-        #print(limits.shape)
-        #print(channel_population[0][0:100] - self.overlap_ratio)
-        #print(torch.flatten(source.mean(dim=1), start_dim=1).shape)
-        #channel_population_dist = torch.abs(channel_population - limits).mean()
-        chunks = torch.chunk(source, self.split, dim=1)
-        vars = []
-        spread_amounts = []
-        pop_dists = []
-        limitations = []
-        count = 0.0
-        for c in chunks:
-            v_masks = torch.ones_like(c)
-            h_masks = v_masks.sum(dim=2, keepdim=True) / float(c.shape[3] * c.shape[2])
-            h_masks = 2*h_masks.cumsum(dim=3) - 1
-            v_masks = v_masks.sum(dim=3, keepdim=True) / float(c.shape[3] * c.shape[2])
-            v_masks = 2*v_masks.cumsum(dim=2) - 1
-            #print(v_masks.shape)
-            #print(h_masks.shape)
-            v_dist = torch.softmax(c.sum(dim=3, keepdim=True), dim=2)
-            h_dist = torch.softmax(c.sum(dim=2, keepdim=True), dim=3)
-            v_mean = torch.sum(v_dist * v_masks, dim=2)
-            h_mean = torch.sum(h_dist * h_masks, dim=3)
-            means = torch.cat((v_mean, h_mean), 2)
-            spread_amounts.append(torch.var(means, dim=1, keepdim=True))
-
-            #spreads = v_vars.mean() + h_vars.mean()
-            #print(torch.flatten(c.mean(dim=1), start_dim=1).shape)
-            flattened = torch.flatten(c, start_dim=2)
-            #spread_amounts.append(torch.cdist(flattened, flattened, p=2).mean(dim=1, keepdim=True))
-            vars.append(torch.var(flattened.mean(dim=1), dim=1, keepdim=True))
-            pop_dists.append(torch.abs(flattened.mean(dim=2).mean(dim=1, keepdim=True) - ((0.3 / self.split) * count + 0.05)))
-            limitations.append(torch.relu(flattened.mean(dim=2) - ((0.3 / self.split) * count + 0.05)).mean(dim=1, keepdim=True))
-            #print(torch.flatten(torch.prod(c, dim=1, keepdim=True), start_dim=1).mean(dim=1, keepdim=True).shape)
-            #print(c[0][0:20])
-            count += 1.0
-        #print(vars[0].shape)
-        variance = torch.cat(vars, 1).mean()
-        spreads = -torch.cat(spread_amounts, 1).mean()
-        channel_population_dist = torch.cat(pop_dists, 1).mean()
-        limited = torch.cat(limitations, 1).mean()
+        occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
+        flattened_screens = source.flatten(start_dim=2)
+        screen_means = flattened_screens.mean(dim=2)
+        channel_var_score = torch.relu(torch.abs(screen_means.var(dim=1) - self.variability).mean() - self.saturation)
+        dist_from_exponential = torch.relu(torch.abs(flattened_screens.var(dim=2) - screen_means.square()).mean() - self.saturation)
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
         #print(channel_population_dist)
         if random.randrange(700) == 0:
-            print(f'dist: {channel_population_dist}, variance: {variance}, spreads: {spreads}, sparcity: {sparcity}')
+            print(f'occupancy_score: {occupancy_score}, channel_var_score: {channel_var_score}, dist_from_exponential: {dist_from_exponential}')
 
-        return channel_population_dist + variance + sparcity + limited + channel_vars
+        return occupancy_score + channel_var_score + dist_from_exponential
 
 def pixel_accuracy(predictions, batch_labels):
     # Assumes softmax input images
