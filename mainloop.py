@@ -25,7 +25,7 @@ class USSegLoss(nn.Module):
         self.split = 16
         self.occupancy = 0.3
         self.variability = 0.07
-        self.saturation = 0.007
+        self.saturation = 0.05
 
     def forward(self, source):
         occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
@@ -51,13 +51,14 @@ def pixel_accuracy(predictions, batch_labels):
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
     batch_count = 1
     classifier.train()
+    classifier.backbone.eval()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
-        #normalized_masks = predictions.softmax(dim=1)
-        loss = loss_fun(torch.tanh(predictions))
+        normalized_masks = predictions.softmax(dim=1)
+        loss = loss_fun(normalized_masks, batch_labels)
         #print(list(list(classifier.children())[-1][0].children())[0].weight.is_leaf)
         loss.backward()
         optimizer.step()
@@ -104,7 +105,7 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT).backbone
+    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -121,8 +122,14 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
         classifier.load_state_dict(torch.load(load_file_name))
         print('Done loading')
 
+    classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005.torch'))
+    for p in classifier.backbone.parameters():
+        p.requires_grad = False
+    print('Loaded backbone dict')
+
     print('Network initialized')
-    loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
+    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
+    loss_fun = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.9)
     print('Starting optimization')
@@ -138,7 +145,7 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
     for epoch in range(EPOCH_COUNT):
         print(f'Epoch: {epoch}')
         train_epoch(dataloader, optimizer, classifier, loss_fun, device)
-        #validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
         if save_file_name:
             print(f'Saving model to file {save_file_name}...')
             torch.save(classifier.state_dict(), save_file_name)
