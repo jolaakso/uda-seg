@@ -28,11 +28,11 @@ class USSegLoss(nn.Module):
         self.saturation = 0.05
 
     def forward(self, source):
-        occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
+        occupancy_score = torch.square(source.mean() - self.occupancy).mean()
         flattened_screens = source.flatten(start_dim=2)
         screen_means = flattened_screens.mean(dim=2)
-        channel_var_score = torch.relu(torch.abs(screen_means.var(dim=1) - self.variability).mean() - self.saturation)
-        dist_from_exponential = torch.relu(torch.abs(flattened_screens.var(dim=2) - screen_means.square()).mean() - self.saturation)
+        channel_var_score = torch.square(screen_means.var(dim=1) - self.variability).mean()
+        dist_from_exponential = torch.square(flattened_screens.var(dim=2) - screen_means.square()).mean()
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
@@ -51,14 +51,13 @@ def pixel_accuracy(predictions, batch_labels):
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
     batch_count = 1
     classifier.train()
-    classifier.backbone.eval()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
-        normalized_masks = predictions.softmax(dim=1)
-        loss = loss_fun(normalized_masks, batch_labels)
+        #normalized_masks = predictions.softmax(dim=1)
+        loss = loss_fun(torch.tanh(predictions))
         #print(list(list(classifier.children())[-1][0].children())[0].weight.is_leaf)
         loss.backward()
         optimizer.step()
@@ -96,16 +95,18 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     print(f'IoU error: {total_mIoU_gain}')
 
 def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False):
-    filelist = GTAVTrainingFileList(dataset_dir)
-    val_filelist = GTAVValFileList(dataset_dir)
-    dataset = TrafficDataset(filelist)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    validation_dataloader = torch.utils.data.DataLoader(TrafficDataset(val_filelist), batch_size=BATCH_SIZE)
-    mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro').to(device)
+    #filelist = GTAVTrainingFileList(dataset_dir)
+    #val_filelist = GTAVValFileList(dataset_dir)
+    #dataset = TrafficDataset(filelist)
+    #dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    #validation_dataloader = torch.utils.data.DataLoader(TrafficDataset(val_filelist), batch_size=BATCH_SIZE)
+    adaptation_filelist = CityscapesValFileList(adaptation_dir)
+    adaptation_dataset = TrafficDataset(adaptation_filelist)
+    adaptation_dataloader = torch.utils.data.DataLoader(adaptation_dataset, batch_size=BATCH_SIZE)
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
+    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = adaptation_dataset.COLOR_COUNT).backbone
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -122,20 +123,19 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
         classifier.load_state_dict(torch.load(load_file_name))
         print('Done loading')
 
-    classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005.torch'))
-    for p in classifier.backbone.parameters():
-        p.requires_grad = False
-    print('Loaded backbone dict')
+    #classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005.torch'))
+    #for p in classifier.backbone.parameters():
+    #    p.requires_grad = False
+    #print('Loaded backbone dict')
 
     print('Network initialized')
-    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
-    loss_fun = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.1)
+    loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
+    #loss_fun = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.03)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.9)
+    #mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro').to(device)
     print('Starting optimization')
     if only_adapt:
-        adaptation_filelist = CityscapesValFileList(adaptation_dir)
-        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), batch_size=BATCH_SIZE)
         print('== DA Validation ==')
         validate(adaptation_dataloader, classifier, device, pixel_accuracy, mIoU)
         print('== DA Validation done ==')
@@ -144,8 +144,8 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
         print(f'Will save the model every epoch to {save_file_name}')
     for epoch in range(EPOCH_COUNT):
         print(f'Epoch: {epoch}')
-        train_epoch(dataloader, optimizer, classifier, loss_fun, device)
-        validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        train_epoch(adaptation_dataloader, optimizer, classifier, loss_fun, device)
+        #validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
         if save_file_name:
             print(f'Saving model to file {save_file_name}...')
             torch.save(classifier.state_dict(), save_file_name)
