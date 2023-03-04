@@ -28,11 +28,11 @@ class USSegLoss(nn.Module):
         self.saturation = 0.05
 
     def forward(self, source):
-        occupancy_score = torch.square(source.mean() - self.occupancy).mean()
+        occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
         flattened_screens = source.flatten(start_dim=2)
         screen_means = flattened_screens.mean(dim=2)
-        channel_var_score = torch.square(screen_means.var(dim=1) - self.variability).mean()
-        dist_from_exponential = torch.square(flattened_screens.var(dim=2) - screen_means.square()).mean()
+        channel_var_score = torch.relu(torch.abs(screen_means.var(dim=1) - self.variability).mean() - self.saturation)
+        dist_from_exponential = torch.relu(torch.abs(flattened_screens.var(dim=2) - screen_means.square()).mean() - self.saturation)
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
