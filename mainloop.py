@@ -51,7 +51,6 @@ def pixel_accuracy(predictions, batch_labels):
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
     batch_count = 1
     classifier.train()
-    classifier.backbone.eval()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
         optimizer.zero_grad()
