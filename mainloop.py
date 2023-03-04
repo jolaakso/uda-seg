@@ -123,8 +123,8 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     else:
         raise Exception(f'Unknown dataset type {dataset}')
 
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    validation_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE)
+    dataloader = torch.utils.data.DataLoader(dataset, drop_last=True, batch_size=BATCH_SIZE, shuffle=True)
+    validation_dataloader = torch.utils.data.DataLoader(val_dataset, drop_last=True, batch_size=BATCH_SIZE)
     mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro').to(device)
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
@@ -159,7 +159,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     print('Starting optimization')
     if only_adapt:
         adaptation_filelist = CityscapesValFileList(adaptation_dir)
-        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), batch_size=BATCH_SIZE)
+        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), drop_last=True, batch_size=BATCH_SIZE)
         print('== DA Validation ==')
         validate(adaptation_dataloader, classifier, device, pixel_accuracy, mIoU)
         print('== DA Validation done ==')
