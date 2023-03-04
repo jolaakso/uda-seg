@@ -149,6 +149,22 @@ class CityscapesValFileList():
         assert(images_len == len(self.label_names))
         return images_len
 
+class CityscapesTrainFileList():
+    def __init__(self, path):
+        self.path = path
+        self.imagespath = os.path.join(path, 'leftImg8bit/')
+        self.labelspath = os.path.join(path, 'gtFine/')
+        self.image_names = glob.glob(f'{self.imagespath}/train/*/*.png')
+        self.label_names = glob.glob(f'{self.labelspath}/train/*/*_labelIds.png')
+
+    def __getitem__(self, i):
+        return (self.image_names[i], self.label_names[i])
+
+    def __len__(self):
+        images_len = len(self.image_names)
+        assert(images_len == len(self.label_names))
+        return images_len
+
 class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 20
     TOTAL_COLOR_COUNT = 35
