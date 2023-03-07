@@ -78,25 +78,34 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     total_batches = len(dataloader)
     validation_loss = 0
     total_mIoU_gain = 0
+    total_classIoU_gain = None
     with torch.no_grad():
         for batch_images, batch_labels in dataloader:
             batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
             predictions = classifier(batch_images)['out']
             normalized_masks = predictions.softmax(dim=1)
             loss = validation_loss_fun(normalized_masks, batch_labels)
+            mIoUGainFun.average = 'macro'
             mIoUGain = mIoUGainFun(normalized_masks, batch_labels)
             mIoUGainFun.average = 'none'
-            print(mIoUGainFun(normalized_masks, batch_labels))
-            mIoUGainFun.average = 'macro'
+            classIoUGain = mIoUGainFun(normalized_masks, batch_labels)
             validation_loss += loss
             total_mIoU_gain += mIoUGain
+
+            if total_classIoU_gain == None:
+                total_classIoU_gain = classIoUGain
+            else:
+                total_classIoU_gain += classIoUGain
+
             if batch_count % 10 == 0:
                 print(f'Validation batch: {batch_count}, Loss: {loss}, mIoU: {mIoUGain}')
             batch_count += 1
     validation_loss /= float(total_batches)
     total_mIoU_gain /= float(total_batches)
+    total_classIoU_gain /= float(total_batches)
     print(f'Validation error: {validation_loss}')
     print(f'IoU error: {total_mIoU_gain}')
+    print(f'Class IoU errors: {total_classIoU_gain}')
 
 def load_gtav_set(dataset_dir):
     filelist = GTAVTrainingFileList(dataset_dir)
