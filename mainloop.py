@@ -57,8 +57,9 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
-        #normalized_masks = predictions.softmax(dim=1)
-        loss = loss_fun(torch.tanh(predictions))
+        normalized_masks = predictions.softmax(dim=1)
+        #loss = loss_fun(torch.tanh(predictions))
+        loss = loss_fun(normalized_masks, batch_labels)
         #print(list(list(classifier.children())[-1][0].children())[0].weight.is_leaf)
         loss.backward()
         optimizer.step()
@@ -141,7 +142,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = adaptation_dataset.COLOR_COUNT).backbone
+    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -171,7 +172,9 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     loss_fun = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.5)
+
     print('Starting optimization')
+
     if only_adapt:
         adaptation_filelist = CityscapesValFileList(adaptation_dir)
         adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), drop_last=True, batch_size=BATCH_SIZE)
@@ -183,8 +186,8 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
         print(f'Will save the model every epoch to {save_file_name}')
     for epoch in range(EPOCH_COUNT):
         print(f'Epoch: {epoch}')
-        train_epoch(adaptation_dataloader, optimizer, classifier, loss_fun, device)
-        #validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        train_epoch(dataloader, optimizer, classifier, loss_fun, device)
+        validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
         if save_file_name:
             print(f'Saving model to file {save_file_name}...')
             torch.save(classifier.state_dict(), save_file_name)
