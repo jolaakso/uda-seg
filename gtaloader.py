@@ -171,9 +171,9 @@ class TrafficDataset(torch.utils.data.Dataset):
 
     def __init__(self, filelist, resize=(720, 1280), crop_size=(720, 1280)):
         super().__init__()
-        self.crop = tv.transforms.RandomCrop((704, 1264))
-        self.img_resize = tv.transforms.Resize(resize, interpolation=InterpolationMode.BICUBIC)
-        self.label_resize = tv.transforms.Resize(resize, interpolation=InterpolationMode.NEAREST_EXACT)
+        self.crop = tv.transforms.RandomCrop(crop_size)
+        self.img_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.BICUBIC)
+        self.label_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.NEAREST)
         self.normalize_colors = tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         self.filelist = filelist
 
