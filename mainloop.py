@@ -2,7 +2,8 @@ import torch
 import torchvision as tv
 from torchmetrics.classification import MulticlassJaccardIndex
 from torch import nn
-from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList
+from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList
+from torchvision.models import ResNet50_Weights
 import argparse
 import sys
 from acc_conv import AccConv2d
@@ -11,9 +12,9 @@ from BigConv import BigConvBlock
 import random
 #import matplotlib.pyplot as plt
 
-BATCH_SIZE = 2
+BATCH_SIZE = 5
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 7
+EPOCH_COUNT = 10
 
 class USSegLoss(nn.Module):
     def __init__(self, weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to('cpu'), overlap_ratio=0.1):
@@ -49,7 +50,7 @@ def pixel_accuracy(predictions, batch_labels):
     return float(correct.sum()) / float(correct.numel())
 
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
-    batch_count = 1
+    batch_count = 0
     classifier.train()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
@@ -73,7 +74,7 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
 def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     classifier.eval()
     print('Validating...')
-    batch_count = 1
+    batch_count = 0
     total_batches = len(dataloader)
     validation_loss = 0
     total_mIoU_gain = 0
@@ -84,6 +85,9 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
             normalized_masks = predictions.softmax(dim=1)
             loss = validation_loss_fun(normalized_masks, batch_labels)
             mIoUGain = mIoUGainFun(normalized_masks, batch_labels)
+            mIoUGainFun.average = 'none'
+            print(mIoUGainFun(normalized_masks, batch_labels))
+            mIoUGainFun.average = 'macro'
             validation_loss += loss
             total_mIoU_gain += mIoUGain
             if batch_count % 10 == 0:
@@ -94,15 +98,37 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     print(f'Validation error: {validation_loss}')
     print(f'IoU error: {total_mIoU_gain}')
 
-def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False):
-    #filelist = GTAVTrainingFileList(dataset_dir)
-    #val_filelist = GTAVValFileList(dataset_dir)
-    #dataset = TrafficDataset(filelist)
-    #dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    #validation_dataloader = torch.utils.data.DataLoader(TrafficDataset(val_filelist), batch_size=BATCH_SIZE)
-    adaptation_filelist = CityscapesValFileList(adaptation_dir)
-    adaptation_dataset = TrafficDataset(adaptation_filelist)
-    adaptation_dataloader = torch.utils.data.DataLoader(adaptation_dataset, batch_size=BATCH_SIZE)
+def load_gtav_set(dataset_dir):
+    filelist = GTAVTrainingFileList(dataset_dir)
+    val_filelist = GTAVValFileList(dataset_dir)
+    dataset = TrafficDataset(filelist, resize=(720, 1280), crop_size=(720, 1280))
+    val_dataset = TrafficDataset(val_filelist, resize=(720, 1280), crop_size=(720, 1280))
+
+    return dataset, val_dataset
+
+def load_cityscapes_set(dataset_dir):
+    filelist = CityscapesTrainFileList(dataset_dir)
+    val_filelist = CityscapesValFileList(dataset_dir)
+    dataset = TrafficDataset(filelist, resize=(512, 1024), crop_size=(512, 1024))
+    val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
+
+    return dataset, val_dataset
+
+def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, load_resnet50_weights=False):
+
+    dataset, val_dataset = (None, None)
+    if dataset_type == 'gtav':
+        dataset, val_dataset = load_gtav_set(dataset_dir)
+        print(f'Loaded GTAV dataset at {dataset_dir}')
+    elif dataset_type == 'cityscapes':
+        dataset, val_dataset = load_cityscapes_set(dataset_dir)
+        print(f'Loaded Cityscapes dataset at {dataset_dir}')
+    else:
+        raise Exception(f'Unknown dataset type {dataset}')
+
+    dataloader = torch.utils.data.DataLoader(dataset, drop_last=True, batch_size=BATCH_SIZE, shuffle=True)
+    validation_dataloader = torch.utils.data.DataLoader(val_dataset, drop_last=True, batch_size=BATCH_SIZE)
+    mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro').to(device)
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
@@ -123,19 +149,23 @@ def start(save_file_name=None, load_file_name=None, dataset_dir='../datasetit/gt
         classifier.load_state_dict(torch.load(load_file_name))
         print('Done loading')
 
-    #classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005.torch'))
+    if load_resnet50_weights:
+        print('Loaded pretrained ResNet50 weights (ImageNet)')
+        classifier.backbone.load_state_dict(torch.hub.load_state_dict_from_url('https://download.pytorch.org/models/resnet50-11ad3fa6.pth'), strict=False)
+    #classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005-only-target.torch'))
     #for p in classifier.backbone.parameters():
     #    p.requires_grad = False
     #print('Loaded backbone dict')
 
     print('Network initialized')
-    loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
-    #loss_fun = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.03)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.9)
-    #mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro').to(device)
+    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
+    loss_fun = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.5)
     print('Starting optimization')
     if only_adapt:
+        adaptation_filelist = CityscapesValFileList(adaptation_dir)
+        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), drop_last=True, batch_size=BATCH_SIZE)
         print('== DA Validation ==')
         validate(adaptation_dataloader, classifier, device, pixel_accuracy, mIoU)
         print('== DA Validation done ==')
@@ -160,8 +190,10 @@ if __name__ == "__main__":
     parser.add_argument('--save', dest='save_file_name')
     parser.add_argument('--load', dest='load_file_name')
     parser.add_argument('--dataset', dest='dataset_dir')
+    parser.add_argument('--dataset-type', dest='dataset_type')
     parser.add_argument('--adaptset', dest='adaptset_dir')
     parser.add_argument('--device', dest='device')
+    parser.add_argument('--load-resnet50-weights', dest='load_resnet50_weights', action='store_true')
     parser.add_argument('--only-adapt', dest='only_adapt', action='store_true')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt)
+    start(args.save_file_name, args.load_file_name, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.load_resnet50_weights)
