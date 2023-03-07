@@ -169,9 +169,12 @@ class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 20
     TOTAL_COLOR_COUNT = 35
 
-    def __init__(self, filelist):
+    def __init__(self, filelist, resize=(720, 1280), crop_size=(720, 1280)):
         super().__init__()
         self.crop = tv.transforms.RandomCrop((704, 1264))
+        self.img_resize = tv.transforms.Resize(resize, interpolation=InterpolationMode.BICUBIC)
+        self.label_resize = tv.transforms.Resize(resize, interpolation=InterpolationMode.NEAREST_EXACT)
+        self.normalize_colors = tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         self.filelist = filelist
 
     def __len__(self):
@@ -186,9 +189,12 @@ class TrafficDataset(torch.utils.data.Dataset):
         image = tv.io.image.read_image(image_path)
         label_image = tv.io.image.read_image(label_path)
         # crop from same place randomly
+        image = self.img_resize(image)
+        label_image = self.label_resize(label_image)
         image, label_image = torch.split(self.crop(torch.cat((image, label_image), 0)), (3, 1), 0)
         image = tv.transforms.functional.convert_image_dtype(image, dtype=torch.float32)
         label_image = label_image.to(torch.int32)
         label_image = self.nullify_voids(label_image)
+        image = self.normalize_colors(image)
         #label_image = tv.transforms.functional.convert_image_dtype(label_image[0], dtype=torch.int64)
         return image, label_image[0].long()
