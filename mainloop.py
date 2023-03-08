@@ -14,7 +14,7 @@ import random
 
 BATCH_SIZE = 5
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 10
+EPOCH_COUNT = 4
 
 class USSegLoss(nn.Module):
     def __init__(self, weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to('cpu'), overlap_ratio=0.1):
@@ -49,7 +49,7 @@ def pixel_accuracy(predictions, batch_labels):
     correct = torch.eq(predicted_labels, batch_labels).int()
     return float(correct.sum()) / float(correct.numel())
 
-def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
+def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler):
     batch_count = 0
     classifier.train()
     total_loss = 0
@@ -64,11 +64,12 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device):
         loss.backward()
         optimizer.step()
         if batch_count % 10 == 0:
-            print(f'Training batch: {batch_count}, Loss: {loss.item()}')
+            print(f'Training batch: {batch_count}, Loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
             #plt.imshow(predictions[0][0].detach().numpy())
             #plt.show()
         total_loss += loss.item()
         batch_count += 1
+        scheduler.step()
     total_loss /= float(batch_count)
     print(f'Mean training loss for epoch: {total_loss}')
 
@@ -119,6 +120,7 @@ def load_gtav_set(dataset_dir):
 def load_cityscapes_set(dataset_dir):
     filelist = CityscapesTrainFileList(dataset_dir)
     val_filelist = CityscapesValFileList(dataset_dir)
+    assert len(set(filelist) & set(val_filelist)) == 0
     dataset = TrafficDataset(filelist, resize=(512, 1024), crop_size=(512, 1024))
     val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
 
@@ -171,7 +173,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
     loss_fun = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.5)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
 
     print('Starting optimization')
 
@@ -186,13 +188,12 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
         print(f'Will save the model every epoch to {save_file_name}')
     for epoch in range(EPOCH_COUNT):
         print(f'Epoch: {epoch}')
-        train_epoch(dataloader, optimizer, classifier, loss_fun, device)
+        train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler)
         validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
         if save_file_name:
             print(f'Saving model to file {save_file_name}...')
             torch.save(classifier.state_dict(), save_file_name)
             print('Done saving')
-        scheduler.step()
 
 if __name__ == "__main__":
     #img = tv.io.read_image('english-black-lab-puppy.jpg')
