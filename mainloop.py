@@ -110,9 +110,10 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     print(f'Class IoU errors: {total_classIoU_gain}')
 
 def load_gtav_set(dataset_dir):
-    filelist = GTAVTrainingFileList(dataset_dir)
-    val_filelist = GTAVValFileList(dataset_dir)
-    dataset = TrafficDataset(filelist, resize=(720, 1280), crop_size=(720, 1280))
+    filelist = GTAVTrainingFileList(dataset_dir, training_split_ratio=0.95)
+    val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.95)
+    assert len(set(filelist) & set(val_filelist)) == 0
+    dataset = TrafficDataset(filelist, resize=(720, 1280), crop_size=(720, 1280), train_augmentations=True)
     val_dataset = TrafficDataset(val_filelist, resize=(720, 1280), crop_size=(720, 1280))
 
     return dataset, val_dataset

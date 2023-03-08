@@ -169,13 +169,20 @@ class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 20
     TOTAL_COLOR_COUNT = 35
 
-    def __init__(self, filelist, resize=(720, 1280), crop_size=(720, 1280)):
+    def __init__(self, filelist, resize=(720, 1280), crop_size=(720, 1280), train_augmentations=False):
         super().__init__()
         self.crop = tv.transforms.RandomCrop(crop_size)
         self.img_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.BICUBIC)
         self.label_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.NEAREST)
         self.normalize_colors = tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
         self.filelist = filelist
+        self.train_augmentations = train_augmentations
+        if train_augmentations:
+            self.augmentations = tv.transforms.Compose([
+                tv.transforms.RandomHorizontalFlip(),
+                tv.transforms.ColorJitter(0.25, 0.25, 0.25, 0.25),
+                tv.transforms.GaussianBlur(5)
+            ])
 
     def __len__(self):
         return len(self.filelist)
@@ -196,5 +203,7 @@ class TrafficDataset(torch.utils.data.Dataset):
         label_image = label_image.to(torch.int32)
         label_image = self.nullify_voids(label_image)
         image = self.normalize_colors(image)
+        if self.train_augmentations:
+            image = self.augmentations(image)
         #label_image = tv.transforms.functional.convert_image_dtype(label_image[0], dtype=torch.int64)
         return image, label_image[0].long()
