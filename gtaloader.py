@@ -165,13 +165,60 @@ class CityscapesTrainFileList():
         assert(images_len == len(self.label_names))
         return images_len
 
+class UPCropper(torch.nn.Module):
+    def __init__(self, crop_size=(720, 1280), samples=1, ignore_label=0, label_count=20, label_costs=None, device='cpu'):
+        super().__init__()
+        self.crop = tv.transforms.RandomCrop(crop_size)
+        self.samples = samples
+        self.label_count = label_count
+        self.ignore_label = ignore_label
+        if label_costs == None:
+            self.label_costs = torch.ones(label_count, device=device, dtype=torch.float32) / label_count
+        else:
+            self.label_costs = label_costs
+
+    def likelihood(self, label_image):
+        labels_histogram = torch.bincount(label_image.flatten(), minlength=self.label_count).to(torch.float32)
+        labels_histogram[self.ignore_label] = 0
+        labels_distribution = torch.nn.functional.normalize(labels_histogram, p=1, dim=0)
+        cost = (self.label_costs.square() * labels_distribution).sum()
+
+        return cost, labels_distribution
+
+    def crop_randomly(self, image, label_image):
+        cropped_image, cropped_label_image = torch.split(self.crop(torch.cat((image, label_image), 0)), (3, 1), 0)
+        cropped_label_image = cropped_label_image.to(label_image.dtype)
+        return cropped_image, cropped_label_image
+
+    def forward(self, image, label_image):
+        if self.samples < 1:
+            raise RuntimeException(f'samples {self.samples} < 1')
+
+        best_image, best_label_image = self.crop_randomly(image, label_image)
+        best_cost, best_distribution = self.likelihood(best_label_image)
+
+        for _ in range(self.samples - 1):
+            cand_image, cand_label_image = self.crop_randomly(image, label_image)
+            cost, distribution = self.likelihood(cand_label_image.to(label_image.dtype))
+
+            if cost < best_cost:
+                best_cost = cost
+                best_distribution = distribution
+                best_image = cand_image
+                best_label_image = cand_label_image
+
+        self.label_costs += best_distribution
+
+        return best_image, best_label_image
+
+
 class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 20
     TOTAL_COLOR_COUNT = 35
 
-    def __init__(self, filelist, resize=(720, 1280), crop_size=(720, 1280), train_augmentations=False):
+    def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu'):
         super().__init__()
-        self.crop = tv.transforms.RandomCrop(crop_size)
+        self.device = device
         self.img_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.BICUBIC)
         self.label_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.NEAREST)
         self.normalize_colors = tv.transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -180,30 +227,38 @@ class TrafficDataset(torch.utils.data.Dataset):
         if train_augmentations:
             self.augmentations = tv.transforms.Compose([
                 tv.transforms.RandomHorizontalFlip(),
-                tv.transforms.ColorJitter(0.25, 0.25, 0.25, 0.25),
-                tv.transforms.GaussianBlur(5)
+                tv.transforms.ColorJitter(0.1, 0.1, 0.1, 0.1),
+                tv.transforms.GaussianBlur(5, sigma=(0.01, 1.0))
             ])
+        self.cropper = None
+        if cropper:
+            self.cropper = cropper
+        self.used_class_names = USED_CLASS_NAMES.to(device)
 
     def __len__(self):
         return len(self.filelist)
 
     def nullify_voids(self, label_image):
         original_shape = label_image.shape
-        return torch.index_select(USED_CLASS_NAMES, 0, label_image.flatten()).reshape(original_shape)
+        nulled = torch.index_select(self.used_class_names, 0, label_image.flatten()).reshape(original_shape)
+        # 0 as the void class
+        return nulled
 
     def __getitem__(self, i):
         image_path, label_path = self.filelist[i]
-        image = tv.io.image.read_image(image_path)
-        label_image = tv.io.image.read_image(label_path)
+        image = tv.io.image.read_image(image_path).to(self.device)
+        label_image = tv.io.image.read_image(label_path).to(self.device)
         # crop from same place randomly
         image = self.img_resize(image)
         label_image = self.label_resize(label_image)
-        image, label_image = torch.split(self.crop(torch.cat((image, label_image), 0)), (3, 1), 0)
         image = tv.transforms.functional.convert_image_dtype(image, dtype=torch.float32)
         label_image = label_image.to(torch.int32)
         label_image = self.nullify_voids(label_image)
-        image = self.normalize_colors(image)
+        if self.cropper:
+            image, label_image = self.cropper(image, label_image)
         if self.train_augmentations:
             image = self.augmentations(image)
+        image = self.normalize_colors(image)
+
         #label_image = tv.transforms.functional.convert_image_dtype(label_image[0], dtype=torch.int64)
         return image, label_image[0].long()

@@ -2,8 +2,7 @@ import torch
 import torchvision as tv
 from torchmetrics.classification import MulticlassJaccardIndex
 from torch import nn
-from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList
-from torchvision.models import ResNet50_Weights
+from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList, UPCropper
 import argparse
 import sys
 from acc_conv import AccConv2d
@@ -12,9 +11,10 @@ from BigConv import BigConvBlock
 import random
 #import matplotlib.pyplot as plt
 
-BATCH_SIZE = 5
+BATCH_SIZE = 2
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 4
+EPOCH_COUNT = 25
+EPOCH_LENGTH = 1000
 
 class USSegLoss(nn.Module):
     def __init__(self, weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to('cpu'), overlap_ratio=0.1):
@@ -70,6 +70,8 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler):
         total_loss += loss.item()
         batch_count += 1
         scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
     total_loss /= float(batch_count)
     print(f'Mean training loss for epoch: {total_loss}')
 
@@ -109,21 +111,25 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     print(f'IoU error: {total_mIoU_gain}')
     print(f'Class IoU errors: {total_classIoU_gain}')
 
-def load_gtav_set(dataset_dir):
+def load_gtav_set(dataset_dir, device='cpu'):
     filelist = GTAVTrainingFileList(dataset_dir, training_split_ratio=0.95)
     val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.95)
     assert len(set(filelist) & set(val_filelist)) == 0
-    dataset = TrafficDataset(filelist, resize=(720, 1280), crop_size=(720, 1280), train_augmentations=True)
-    val_dataset = TrafficDataset(val_filelist, resize=(720, 1280), crop_size=(720, 1280))
+    # orig size (704, 1264)?
+    up_cropper = UPCropper(device=device, crop_size=(512, 512), samples=5)
+
+    dataset = TrafficDataset(filelist, resize=(1052, 1914), train_augmentations=True, cropper=up_cropper, device=device)
+    val_dataset = TrafficDataset(val_filelist, resize=(1052, 1914), device=device)
 
     return dataset, val_dataset
 
-def load_cityscapes_set(dataset_dir):
+def load_cityscapes_set(dataset_dir, device='cpu'):
     filelist = CityscapesTrainFileList(dataset_dir)
     val_filelist = CityscapesValFileList(dataset_dir)
     assert len(set(filelist) & set(val_filelist)) == 0
-    dataset = TrafficDataset(filelist, resize=(512, 1024), crop_size=(512, 1024))
-    val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
+    dataset = TrafficDataset(filelist, resize=(512, 1024), device=device)
+    val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), device=device)
+    #val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
 
     return dataset, val_dataset
 
@@ -131,7 +137,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
 
     dataset, val_dataset = (None, None)
     if dataset_type == 'gtav':
-        dataset, val_dataset = load_gtav_set(dataset_dir)
+        dataset, val_dataset = load_gtav_set(dataset_dir, device=device)
         print(f'Loaded GTAV dataset at {dataset_dir}')
     elif dataset_type == 'cityscapes':
         dataset, val_dataset = load_cityscapes_set(dataset_dir)
@@ -145,7 +151,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
+    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT, weights_backbone=None)
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -157,24 +163,34 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     #    classifier.classifier[0])
     classifier = classifier.to(device)
 
+
+    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
+    epoch_batches = len(dataloader)
+    if EPOCH_LENGTH:
+        epoch_batches = min(EPOCH_LENGTH, len(dataloader))
+    loss_fun = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
+    epoch = 0
+
     if load_file_name:
-        print(f'Loading model from file {load_file_name}...')
-        classifier.load_state_dict(torch.load(load_file_name))
+        print(f'Loading checkpoint from file {load_file_name}...')
+        checkpoint = torch.load(load_file_name)
+        classifier.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        epoch = checkpoint['epoch']
         print('Done loading')
 
     if load_resnet50_weights:
-        print('Loaded pretrained ResNet50 weights (ImageNet)')
-        classifier.backbone.load_state_dict(torch.hub.load_state_dict_from_url('https://download.pytorch.org/models/resnet50-11ad3fa6.pth'), strict=False)
+        print('Loaded pretrained ResNet101 weights (GTAV)')
+        classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/dataset/gta5_rn101_source.pth'), strict=False)
     #classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005-only-target.torch'))
     #for p in classifier.backbone.parameters():
     #    p.requires_grad = False
     #print('Loaded backbone dict')
 
     print('Network initialized')
-    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
-    loss_fun = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
-    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
 
     print('Starting optimization')
 
@@ -186,15 +202,27 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
         print('== DA Validation done ==')
         return
     if save_file_name:
-        print(f'Will save the model every epoch to {save_file_name}')
-    for epoch in range(EPOCH_COUNT):
+        print(f'Will save the checkpoint every epoch to {save_file_name}')
+    while epoch < EPOCH_COUNT:
         print(f'Epoch: {epoch}')
         train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler)
         validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        epoch += 1
         if save_file_name:
-            print(f'Saving model to file {save_file_name}...')
-            torch.save(classifier.state_dict(), save_file_name)
+            print(f'Saving checkpoint to file {save_file_name}...')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': classifier.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict()
+            }, save_file_name)
             print('Done saving')
+        print(f'Class priors: {dataset.cropper.label_costs}')
+
+        #if save_file_name:
+        #    print(f'Saving model to file {save_file_name}...')
+        #    torch.save(classifier.state_dict(), save_file_name)
+        #    print('Done saving')
 
 if __name__ == "__main__":
     #img = tv.io.read_image('english-black-lab-puppy.jpg')
