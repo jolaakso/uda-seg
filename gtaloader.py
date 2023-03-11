@@ -181,7 +181,8 @@ class UPCropper(torch.nn.Module):
         labels_histogram = torch.bincount(label_image.flatten(), minlength=self.label_count).to(torch.float32)
         labels_histogram[self.ignore_label] = 0
         labels_distribution = torch.nn.functional.normalize(labels_histogram, p=1, dim=0)
-        cost = (self.label_costs.square() * labels_distribution).sum()
+        normalized_label_costs = torch.nn.functional.normalize(self.label_costs, p=1, dim=0)
+        cost = (normalized_label_costs * labels_distribution).sum()
 
         return cost, labels_distribution
 
@@ -209,14 +210,14 @@ class UPCropper(torch.nn.Module):
 
         self.label_costs += best_distribution
 
-        return best_image, best_label_image
+        return best_image, best_label_image, best_cost
 
 
 class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 20
     TOTAL_COLOR_COUNT = 35
 
-    def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu'):
+    def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu', include_label_cost=False):
         super().__init__()
         self.device = device
         self.img_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.BICUBIC)
@@ -234,6 +235,7 @@ class TrafficDataset(torch.utils.data.Dataset):
         if cropper:
             self.cropper = cropper
         self.used_class_names = USED_CLASS_NAMES.to(device)
+        self.include_label_cost = include_label_cost
 
     def __len__(self):
         return len(self.filelist)
@@ -254,11 +256,14 @@ class TrafficDataset(torch.utils.data.Dataset):
         image = tv.transforms.functional.convert_image_dtype(image, dtype=torch.float32)
         label_image = label_image.to(torch.int32)
         label_image = self.nullify_voids(label_image)
+        cost = 0
         if self.cropper:
-            image, label_image = self.cropper(image, label_image)
+            image, label_image, cost = self.cropper(image, label_image)
         if self.train_augmentations:
             image = self.augmentations(image)
         image = self.normalize_colors(image)
 
+        if self.cropper and self.include_label_cost:
+            return image, label_image[0].long(), cost
         #label_image = tv.transforms.functional.convert_image_dtype(label_image[0], dtype=torch.int64)
         return image, label_image[0].long()
