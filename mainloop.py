@@ -17,11 +17,10 @@ EPOCH_COUNT = 25
 EPOCH_LENGTH = 1000
 
 class USSegLoss(nn.Module):
-    def __init__(self, weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to('cpu'), overlap_ratio=0.1):
+    def __init__(self, overlap_ratio=0.1):
         super().__init__()
         self.wide_gaussian = tv.transforms.GaussianBlur(7, 5)
         self.narrow_gaussian = tv.transforms.GaussianBlur(7, 2)
-        self.weights = weights
         self.overlap_ratio = overlap_ratio
         self.split = 16
         self.occupancy = 0.3
@@ -49,16 +48,21 @@ def pixel_accuracy(predictions, batch_labels):
     correct = torch.eq(predicted_labels, batch_labels).int()
     return float(correct.sum()) / float(correct.numel())
 
-def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler):
+def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised=False, lock_backbone=False):
     batch_count = 0
     classifier.train()
+    if lock_backbone:
+        classifier.backbone.eval()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
-        #loss = loss_fun(torch.tanh(predictions))
-        loss = loss_fun(predictions, batch_labels)
+        loss = None
+        if unsupervised:
+            loss = loss_fun(predictions)
+        else:
+            loss = loss_fun(predictions, batch_labels)
         #print(list(list(classifier.children())[-1][0].children())[0].weight.is_leaf)
         loss.backward()
         optimizer.step()
@@ -115,15 +119,10 @@ def load_gtav_set(dataset_dir, device='cpu'):
     val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.97)
     assert len(set(filelist) & set(val_filelist)) == 0
     # orig size (704, 1264)?
-    # Weights:
-    # [       0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
-    #   8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
-    #   2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
-    #   2.7946e+03, 1.7960e+04]
-    up_cropper = UPCropper(device=device, crop_size=(704, 1264), samples=1)
+    #up_cropper = UPCropper(device=device, crop_size=(720, 1280), samples=1)
 
-    dataset = TrafficDataset(filelist, resize=(1052, 1914), train_augmentations=True, cropper=up_cropper, device=device)
-    val_dataset = TrafficDataset(val_filelist, resize=(1052, 1914), device=device)
+    dataset = TrafficDataset(filelist, resize=(720, 1280), train_augmentations=True, device=device)
+    val_dataset = TrafficDataset(val_filelist, resize=(720, 1280), device=device)
 
     return dataset, val_dataset
 
@@ -131,22 +130,22 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
     filelist = CityscapesTrainFileList(dataset_dir)
     val_filelist = CityscapesValFileList(dataset_dir)
     assert len(set(filelist) & set(val_filelist)) == 0
-    dataset = TrafficDataset(filelist, resize=(512, 1024), device=device)
+    dataset = TrafficDataset(filelist, resize=(512, 1024), train_augmentations=True, device=device)
     val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), device=device)
     #val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, load_resnet50_weights=False):
+def start(save_file_name=None, load_file_name=None, load_backbone=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False):
 
     dataset, val_dataset = (None, None)
     loss_weights = None
     if dataset_type == 'gtav':
         dataset, val_dataset = load_gtav_set(dataset_dir, device=device)
-        loss_weights = torch.Tensor([0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
-                                     8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
-                                     2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
-                                     2.7946e+03, 1.7960e+04]).to(device)
+        #loss_weights = torch.Tensor([0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
+        #                             8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
+        #                             2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
+        #                             2.7946e+03, 1.7960e+04]).to(device)
         print(f'Loaded GTAV dataset at {dataset_dir}')
     elif dataset_type == 'cityscapes':
         dataset, val_dataset = load_cityscapes_set(dataset_dir)
@@ -161,6 +160,8 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
     classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
+    if unsupervised:
+        classifier = nn.Sequential(classifier.backbone, nn.Tanh())
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -173,12 +174,18 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     classifier = classifier.to(device)
 
 
-    #loss_fun = USSegLoss(weights=torch.Tensor([2000.0, 1.0, 1.0]).to(torch.float).to(device), overlap_ratio=0.33)
     epoch_batches = len(dataloader)
     if EPOCH_LENGTH:
         epoch_batches = min(EPOCH_LENGTH, len(dataloader))
-    loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.025)
+
+    loss_fun = None
+
+    if unsupervised:
+        loss_fun = USSegLoss().to(torch.float).to(device), overlap_ratio=0.33)
+    else:
+        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.05, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
     epoch = 0
 
@@ -191,9 +198,15 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
         epoch = checkpoint['epoch']
         print('Done loading')
 
-    if load_resnet50_weights:
-        print('Loaded pretrained ResNet101 weights (GTAV)')
-        classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/dataset/gta5_rn101_source.pth'), strict=False)
+    if load_backbone:
+        print(f'Loading backbone weights from {load_backbone}')
+        classifier.backbone.load_state_dict(torch.load(load_backbone))
+
+    if lock_backbone:
+        print(f'Locking model backbone')
+        for p in classifier.backbone.parameters():
+            p.requires_grad = False
+
     #classifier.backbone.load_state_dict(torch.load('/wrk/users/jola/results/unsupervised-exp-dist-metric-abs-saturation-005-only-target.torch'))
     #for p in classifier.backbone.parameters():
     #    p.requires_grad = False
@@ -214,8 +227,11 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
         print(f'Will save the checkpoint every epoch to {save_file_name}')
     while epoch < EPOCH_COUNT:
         print(f'Epoch: {epoch}')
-        train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler)
-        validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
+
+        if not unsupervised:
+            validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+
         epoch += 1
         if save_file_name:
             print(f'Saving checkpoint to file {save_file_name}...')
@@ -244,7 +260,9 @@ if __name__ == "__main__":
     parser.add_argument('--dataset-type', dest='dataset_type')
     parser.add_argument('--adaptset', dest='adaptset_dir')
     parser.add_argument('--device', dest='device')
-    parser.add_argument('--load-resnet50-weights', dest='load_resnet50_weights', action='store_true')
+    parser.add_argument('--load-backbone', dest='load_backbone')
+    parser.add_argument('--unsupervised', dest='unsupervised', action='store_true')
+    parser.add_argument('--lock-backbone', dest='lock_backbone', action='store_true')
     parser.add_argument('--only-adapt', dest='only_adapt', action='store_true')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.load_resnet50_weights)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone)
