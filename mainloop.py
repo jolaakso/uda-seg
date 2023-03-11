@@ -57,9 +57,8 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler):
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
-        normalized_masks = predictions.softmax(dim=1)
         #loss = loss_fun(torch.tanh(predictions))
-        loss = loss_fun(normalized_masks, batch_labels)
+        loss = loss_fun(predictions, batch_labels)
         #print(list(list(classifier.children())[-1][0].children())[0].weight.is_leaf)
         loss.backward()
         optimizer.step()
@@ -113,10 +112,15 @@ def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
 
 def load_gtav_set(dataset_dir, device='cpu'):
     filelist = GTAVTrainingFileList(dataset_dir, training_split_ratio=0.95)
-    val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.95)
+    val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.97)
     assert len(set(filelist) & set(val_filelist)) == 0
     # orig size (704, 1264)?
-    up_cropper = UPCropper(device=device, crop_size=(512, 512), samples=5)
+    # Weights:
+    # [       0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
+    #   8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
+    #   2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
+    #   2.7946e+03, 1.7960e+04]
+    up_cropper = UPCropper(device=device, crop_size=(704, 1264), samples=1)
 
     dataset = TrafficDataset(filelist, resize=(1052, 1914), train_augmentations=True, cropper=up_cropper, device=device)
     val_dataset = TrafficDataset(val_filelist, resize=(1052, 1914), device=device)
@@ -136,8 +140,13 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
 def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, load_resnet50_weights=False):
 
     dataset, val_dataset = (None, None)
+    loss_weights = None
     if dataset_type == 'gtav':
         dataset, val_dataset = load_gtav_set(dataset_dir, device=device)
+        loss_weights = torch.Tensor([0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
+                                     8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
+                                     2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
+                                     2.7946e+03, 1.7960e+04]).to(device)
         print(f'Loaded GTAV dataset at {dataset_dir}')
     elif dataset_type == 'cityscapes':
         dataset, val_dataset = load_cityscapes_set(dataset_dir)
@@ -151,7 +160,7 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT, weights_backbone=None)
+    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
     #classifier.classifier[0] = nn.Sequential(
     #    nn.Conv2d(2048, 128, 1),
     #    nn.ReLU(),
@@ -168,8 +177,8 @@ def start(save_file_name=None, load_file_name=None, dataset_type='gtav', dataset
     epoch_batches = len(dataloader)
     if EPOCH_LENGTH:
         epoch_batches = min(EPOCH_LENGTH, len(dataloader))
-    loss_fun = nn.CrossEntropyLoss(ignore_index=0)
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.00025, momentum=0.9, weight_decay=0.0005)
+    loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.025)
     scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
     epoch = 0
 
