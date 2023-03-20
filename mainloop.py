@@ -13,6 +13,7 @@ from lsrmodels import DeeplabNW
 #import matplotlib.pyplot as plt
 
 BATCH_SIZE = 8
+LEARNING_RATE = 0.00025
 BATCHES_TO_SAVE = 50
 EPOCH_COUNT = 125
 EPOCH_LENGTH = 1000
@@ -181,13 +182,16 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         epoch_batches = min(EPOCH_LENGTH, len(dataloader))
 
     loss_fun = None
+    optim_params = [{'params': classifier.backbone, 'lr': LEARNING_RATE }]
 
     if unsupervised:
         loss_fun = USSegLoss()
     else:
         loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        optim_params.append({ 'params': classifier.classifier, 'lr': 10 * LEARNING_RATE })
 
-    optimizer = torch.optim.SGD(classifier.parameters(), lr=0.0005, momentum=0.9, weight_decay=0.0005)
+    # 10x LR for classifier, 1x for backbone
+    optimizer = torch.optim.SGD(optim_params, momentum=0.9, weight_decay=0.0005)
     scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
     epoch = 0
 
