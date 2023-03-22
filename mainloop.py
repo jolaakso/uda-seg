@@ -9,6 +9,7 @@ from acc_conv import AccConv2d
 from dcanetv2 import DCANetV2
 from BigConv import BigConvBlock
 import random
+import math
 from lsrmodels import DeeplabNW
 #import matplotlib.pyplot as plt
 
@@ -19,13 +20,30 @@ EPOCH_COUNT = 125
 EPOCH_LENGTH = 1000
 
 class USSegLoss(nn.Module):
-    def __init__(self, occupancy=0.3, variability=0.07, saturation=0.05):
+    def __init__(self, occupancy=0.21, variability=0.07, saturation=0.05):
         super().__init__()
         self.occupancy = occupancy
         self.variability = variability
         self.saturation = saturation
 
-    def forward(self, source):
+    def diff_ent(self, source):
+        H_y = 1.4189       # (1 + math.log(2 * math.pi)) / 2
+        k_1 = 7.4129       # 36 / (8 * math.sqrt(3) - 9)
+        k_2 = 33.6694      # 24 / (16 * math.sqrt(3) - 27)
+        half_sqrt = 0.7071 # math.sqrt(1/2)
+        x = source
+        asymmetry_term = (x * (-x.square() / 2).exp()).mean().square()
+        sparsity_term = ((-x.square() / 2).exp().mean() - half_sqrt).square()
+        return H_y - k_1 * asymmetry_term + k_2 * sparsity_term
+
+    def non_gauss_score(self, source):
+        occupancy_score = -(-(torch.abs(source.mean() - self.occupancy).mean())).exp()
+        channel_var_score = -(-screen_means.var(dim=1).mean()).exp()
+        diff_ent_score = self.diff_ent(source)
+
+        return occupancy_score + channel_var_score + diff_ent_score
+
+    def abs_stat_score(self, source):
         occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
         flattened_screens = source.flatten(start_dim=2)
         screen_means = flattened_screens.mean(dim=2)
@@ -39,6 +57,10 @@ class USSegLoss(nn.Module):
             print(f'occupancy_score: {occupancy_score}, channel_var_score: {channel_var_score}, dist_from_exponential: {dist_from_exponential}')
 
         return occupancy_score + channel_var_score + dist_from_exponential
+
+    def forward(self, source):
+        return self.non_gauss_score(source)
+
 
 def pixel_accuracy(predictions, batch_labels):
     # Assumes softmax input images
