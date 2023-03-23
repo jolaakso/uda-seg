@@ -16,15 +16,16 @@ from lsrmodels import DeeplabNW
 BATCH_SIZE = 8
 LEARNING_RATE = 0.00025
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 125
+EPOCH_COUNT = 20
 EPOCH_LENGTH = 1000
 
 class USSegLoss(nn.Module):
-    def __init__(self, occupancy=0.21, variability=0.07, saturation=0.05):
+    def __init__(self, occupancy=0.21, variability=0.0181, saturation=0.05):
         super().__init__()
         self.occupancy = occupancy
         self.variability = variability
         self.saturation = saturation
+        self.eps = 1e-12
 
     def diff_ent(self, source):
         H_y = 1.4189       # (1 + math.log(2 * math.pi)) / 2
@@ -37,18 +38,39 @@ class USSegLoss(nn.Module):
         return H_y - k_1 * asymmetry_term + k_2 * sparsity_term
 
     def non_gauss_score(self, source):
-        occupancy_score = -(-(torch.abs(source.mean() - self.occupancy).mean())).exp()
-        channel_var_score = -(-screen_means.var(dim=1).mean()).exp()
+        occupancy_score = torch.square(source.mean() - self.occupancy).mean()
+        flattened_screens = source.flatten(start_dim=2)
+        screen_means = flattened_screens.mean(dim=2)
+        channel_var_score = torch.square(screen_means.var(dim=1) - self.variability).mean()
         diff_ent_score = self.diff_ent(source)
+
+        if random.randrange(700) == 0:
+            print(f'occupancy_score: {occupancy_score}, channel_var_score: {channel_var_score}, diff_ent: {diff_ent_score}')
 
         return occupancy_score + channel_var_score + diff_ent_score
 
-    def abs_stat_score(self, source):
-        occupancy_score = torch.relu(torch.abs(source.mean() - self.occupancy).mean() - self.saturation)
+    def sq_stat_score(self, source):
+        occupancy_score = torch.square(source.mean() - self.occupancy).mean()
         flattened_screens = source.flatten(start_dim=2)
         screen_means = flattened_screens.mean(dim=2)
-        channel_var_score = torch.relu(torch.abs(screen_means.var(dim=1) - self.variability).mean() - self.saturation)
-        dist_from_exponential = torch.relu(torch.abs(flattened_screens.var(dim=2) - screen_means.square()).mean() - self.saturation)
+        channel_var_score = torch.square(screen_means.var(dim=1) - self.variability).mean()
+        dist_from_exponential = torch.square(flattened_screens.var(dim=2) - screen_means.square()).mean()
+
+        #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
+        # print(vals * self.weights)
+        #print(channel_population_dist)
+        if random.randrange(700) == 0:
+            print(f'occupancy_score: {occupancy_score}, channel_var_score: {channel_var_score}, dist_from_exponential: {dist_from_exponential}')
+
+        return occupancy_score + channel_var_score + dist_from_exponential
+
+    def abs_stat_score(self, source):
+        occupancy_score = torch.relu((torch.abs(source.mean() - self.occupancy) / self.occupancy).mean() - self.saturation)
+        flattened_screens = source.flatten(start_dim=2)
+        screen_means = flattened_screens.mean(dim=2)
+        channel_var_score = torch.relu((torch.abs(screen_means.var(dim=1) - self.variability) / self.variability).mean()/self.variability - self.saturation)
+        square_screen_means = screen_means.square()
+        dist_from_exponential = torch.relu((torch.abs(flattened_screens.var(dim=2) - square_screen_means)/(square_screen_means + self.eps)).mean() - self.saturation)
 
         #vals = torch.tensor([dog, manhattan, channel_population_dist], requires_grad=True, device=self.weights.device, dtype=self.weights.dtype)
         # print(vals * self.weights)
@@ -59,7 +81,7 @@ class USSegLoss(nn.Module):
         return occupancy_score + channel_var_score + dist_from_exponential
 
     def forward(self, source):
-        return self.non_gauss_score(source)
+        return self.abs_stat_score(source)
 
 
 def pixel_accuracy(predictions, batch_labels):
@@ -204,13 +226,15 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         epoch_batches = min(EPOCH_LENGTH, len(dataloader))
 
     loss_fun = None
-    optim_params = [{'params': classifier.backbone, 'lr': LEARNING_RATE }]
+    optim_params = []
 
     if unsupervised:
         loss_fun = USSegLoss()
+        optim_params = [{'params': classifier.parameters(), 'lr': LEARNING_RATE }]
     else:
         loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
-        optim_params.append({ 'params': classifier.classifier, 'lr': 10 * LEARNING_RATE })
+        optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
+                        { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
 
     # 10x LR for classifier, 1x for backbone
     optimizer = torch.optim.SGD(optim_params, momentum=0.9, weight_decay=0.0005)
