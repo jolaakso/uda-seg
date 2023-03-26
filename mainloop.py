@@ -19,6 +19,54 @@ BATCHES_TO_SAVE = 50
 EPOCH_COUNT = 20
 EPOCH_LENGTH = 1000
 
+class SelfOrganizingNorm2d(nn.Module):
+    # All coords in unit sphere with learnable radius?
+    def __init__(self, channels, proximity_dims=1, p=2, eps=1e-12):
+        super().__init__()
+        self.normalization_space = nn.Parameter(torch.randn(channels, proximity_dims))
+        self.p = p
+        self.gamma = nn.Parameter(torch.randn(1, channels, 1, 1))
+        self.beta = nn.Parameter(torch.randn(1, channels, 1, 1))
+        self.eps = eps
+
+    def _weighted_mean2d(self, x, weights, weights_sum):
+        x = x.mean(3).mean(2)
+        x = nn.functional.linear(x, weights) / weights_sum
+
+        return x.unsqueeze(2).unsqueeze(2)
+
+    def forward(self, x):
+        # This and sum of proximities should be precomputed when in eval mode
+        proximities = torch.cdist(self.normalization_space, self.normalization_space, p=self.p)
+        proximities = torch.exp(-proximities)
+        proximities_sum = proximities.sum(1)
+
+        w_means = self._weighted_mean2d(x, proximities, proximities_sum)
+
+        mean_shifted = x - w_means
+
+        w_vars = self._weighted_mean2d(mean_shifted.square(), proximities, proximities_sum)
+
+        x = mean_shifted / (w_vars + self.eps).sqrt()
+
+        return x * self.gamma + self.beta
+
+def append_sonorm_to_rn50(backbone):
+    backbone.get_submodule('layer1.1').add_module('self_organizing_norm', SelfOrganizingNorm2d(256, 2))
+    backbone.get_submodule('layer1.2').add_module('self_organizing_norm', SelfOrganizingNorm2d(256, 2))
+    backbone.get_submodule('layer2.1').add_module('self_organizing_norm', SelfOrganizingNorm2d(512, 2))
+    backbone.get_submodule('layer2.2').add_module('self_organizing_norm', SelfOrganizingNorm2d(512, 2))
+    backbone.get_submodule('layer2.3').add_module('self_organizing_norm', SelfOrganizingNorm2d(512, 2))
+    backbone.get_submodule('layer3.1').add_module('self_organizing_norm', SelfOrganizingNorm2d(1024, 2))
+    backbone.get_submodule('layer3.2').add_module('self_organizing_norm', SelfOrganizingNorm2d(1024, 2))
+    backbone.get_submodule('layer3.3').add_module('self_organizing_norm', SelfOrganizingNorm2d(1024, 2))
+    backbone.get_submodule('layer3.4').add_module('self_organizing_norm', SelfOrganizingNorm2d(1024, 2))
+    backbone.get_submodule('layer3.5').add_module('self_organizing_norm', SelfOrganizingNorm2d(1024, 2))
+    backbone.get_submodule('layer4.1').add_module('self_organizing_norm', SelfOrganizingNorm2d(2048, 2))
+    backbone.get_submodule('layer4.2').add_module('self_organizing_norm', SelfOrganizingNorm2d(2048, 2))
+
+    print(backbone)
+
 class USSegLoss(nn.Module):
     def __init__(self, occupancy=0.21, variability=0.0181, saturation=0.05):
         super().__init__()
@@ -220,6 +268,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     #    classifier.classifier[0])
     classifier = classifier.to(device)
 
+    #append_sonorm_to_rn50(classifier.backbone)
 
     epoch_batches = len(dataloader)
     if EPOCH_LENGTH:
