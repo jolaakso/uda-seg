@@ -129,7 +129,7 @@ class USSegLoss(nn.Module):
         return occupancy_score + channel_var_score + dist_from_exponential
 
     def forward(self, source):
-        return self.abs_stat_score(source)
+        return self.sq_stat_score(source)
 
 
 def pixel_accuracy(predictions, batch_labels):
@@ -280,6 +280,10 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     if unsupervised:
         loss_fun = USSegLoss()
         optim_params = [{'params': classifier.parameters(), 'lr': LEARNING_RATE }]
+    elif lock_backbone:
+        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        optim_params = [{'params': classifier.backbone.parameters(), 'lr': 0 },
+                        { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
     else:
         loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
@@ -308,6 +312,8 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         classifier.backbone.load_state_dict(torch.load(load_backbone)['model_state_dict'])
 
     if lock_backbone:
+        print('Adding Tanh layer')
+        classifier.backbone.add_module('tanh', nn.Tanh())
         print(f'Locking model backbone')
         for p in classifier.backbone.parameters():
             p.requires_grad = False
@@ -353,6 +359,8 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         #    print(f'Saving model to file {save_file_name}...')
         #    torch.save(classifier.state_dict(), save_file_name)
         #    print('Done saving')
+
+    print('Finished optimization')
 
 if __name__ == "__main__":
     #img = tv.io.read_image('english-black-lab-puppy.jpg')
