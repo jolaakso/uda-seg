@@ -318,7 +318,7 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
     val_filelist = CityscapesValFileList(dataset_dir)
     assert len(set(filelist) & set(val_filelist)) == 0
 
-    up_cropper = UPCropper(device=device, crop_size=(512, 1024), samples=1)
+    up_cropper = UPCropper(device=device, crop_size=(512, 512), samples=1)
 
     dataset = TrafficDataset(filelist, resize=(512, 1024), train_augmentations=True, cropper=up_cropper, device=device)
     val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), device=device)
