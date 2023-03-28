@@ -11,13 +11,42 @@ from BigConv import BigConvBlock
 import random
 import math
 from lsrmodels import DeeplabNW
+import FeatureModifier as fn
 #import matplotlib.pyplot as plt
 
 BATCH_SIZE = 8
 LEARNING_RATE = 0.00025
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 20
+EPOCH_COUNT = 70
 EPOCH_LENGTH = 1000
+
+class TeacherLoss(nn.Module):
+    def __init__(self, teacher):
+        super().__init__()
+        teacher.eval()
+        self.teacher = teacher
+
+    def forward(self, x):
+        return self.teacher(x).mean()
+
+# Based on torchvision/models/segmentation/_utils.py
+class TeacherTrainerWrapper(nn.Module):
+    def __init__(self, classifier):
+        super().__init__()
+        self.classifier = classifier
+
+    def forward(self, x, input_size):
+        x = self.classifier(x)
+        x = torch.nn.functional.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+        return { 'out': x }
+
+class FeatureWeighter(nn.Module):
+    def __init__(self, class_frequencies):
+        super().__init__()
+
+    def forward(self, x, class_map):
+        return x
+
 
 class SelfOrganizingNorm2d(nn.Module):
     # All coords in unit sphere with learnable radius?
@@ -168,6 +197,74 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, 
     total_loss /= float(batch_count)
     print(f'Mean training loss for epoch: {total_loss}')
 
+def train_teacher(dataloader, optimizer, backbone, dumb_backbone, head, teacher, head_loss_fun, teacher_loss_fun, device, scheduler):
+    print('Starting teacher training.')
+    batch_count = 0
+    teacher.train()
+    head.train()
+    backbone.eval()
+    dumb_backbone.eval()
+
+    split_size = dataloader.batch_size // 2
+
+    total_loss = 0
+    for ix, (batch_images, batch_labels) in enumerate(dataloader):
+        optimizer.zero_grad()
+        batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
+        trained_images, dumb_images = batch_images.split(split_size, dim=0)
+        features = torch.cat((backbone(trained_images)['out'], dumb_backbone(dumb_images)['out']), dim=0)
+        features.requires_grad = True
+        head_loss_fun(head(features, batch_images.shape[-2:])['out'], batch_labels).backward()
+
+        target_grad = features.grad
+
+        teacher_loss = teacher_loss_fun(teacher(features), target_grad)
+        teacher_loss.backward()
+
+        # zero to make sure no update on these
+        head.zero_grad()
+        backbone.zero_grad()
+        dumb_backbone.zero_grad()
+        optimizer.step()
+
+        if batch_count % 10 == 0:
+            print(f'Training batch: {batch_count}, Teacher loss: {teacher_loss.item()}, learning rate: {scheduler.get_last_lr()}')
+        total_loss += teacher_loss.item()
+        batch_count += 1
+        scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
+    total_loss /= float(batch_count)
+    print(f'Mean teacher loss for epoch: {total_loss}')
+
+def student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler):
+    print('Starting student training using teacher')
+    batch_count = 0
+    backbone.train()
+
+    split_size = dataloader.batch_size // 2
+
+    total_loss = 0
+    for ix, (batch_images, _) in enumerate(dataloader):
+        optimizer.zero_grad()
+        batch_images = batch_images.to(device)
+        features = backbone(batch_images)['out']
+
+        loss = loss_fun(features)
+        loss.backward()
+
+        optimizer.step()
+
+        if batch_count % 10 == 0:
+            print(f'Training batch: {batch_count}, loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
+        total_loss += loss.item()
+        batch_count += 1
+        scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
+    total_loss /= float(batch_count)
+    print(f'Mean student loss for epoch: {total_loss}')
+
 def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
     classifier.eval()
     print('Validating...')
@@ -229,7 +326,7 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False):
+def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None):
 
     dataset, val_dataset = (None, None)
     loss_weights = None
@@ -254,6 +351,35 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     # params 10413651 (DCANet)
     classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
     # classifier = DeeplabNW(num_classes = dataset.COLOR_COUNT, backbone='resnet50', pretrained=False)
+
+    teacher = None
+    untrained_backbone = None
+    if teacher_mode:
+        print('Initializing teacher network')
+        untrained_backbone = tv.models.segmentation.deeplabv3_resnet50(num_classes = 2048).backbone
+        teacher = fn.FeatureModifier()
+
+        for p in untrained_backbone.parameters():
+            p.requires_grad = False
+
+        teacher = teacher.to(device)
+        untrained_backbone = untrained_backbone.to(device)
+
+    if student_mode:
+        print('Initalizing teacher to train in student mode')
+        teacher = fn.FeatureModifier()
+
+        if not load_teacher:
+            raise RuntimeError('--load-teacher needs to be defined in student mode')
+
+        print(f'Loading teacher from {load_teacher}')
+        teacher.load_state_dict(torch.load(load_teacher)['teacher_state_dict'])
+
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+        teacher = teacher.to(device)
+
 
     if unsupervised:
         classifier = classifier.backbone
@@ -284,6 +410,12 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': 0 },
                         { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
+    elif teacher_mode:
+        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        optim_params = [{'params': teacher.parameters(), 'lr': 10 * LEARNING_RATE}]
+    elif student_mode:
+        loss_fun = TeacherLoss(teacher)
+        optim_params = [{ 'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE }]
     else:
         loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
@@ -301,6 +433,8 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         epoch = checkpoint['epoch']
+        if teacher_mode and 'teacher_state_dict' in checkpoint:
+            teacher.load_state_dict(checkpoint['teacher'])
         print('Done loading')
 
     if load_model:
@@ -338,20 +472,39 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         print(f'Will save the checkpoint every epoch to {save_file_name}')
     while epoch < EPOCH_COUNT:
         print(f'Epoch: {epoch}')
-        train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
+        if teacher_mode:
+            # (dataloader, optimizer, backbone, dumb_backbone, head, teacher, head_loss_fun, teacher_loss_fun, device, scheduler)
+            backbone = classifier.backbone
+            for p in backbone.parameters():
+                p.requires_grad = False
+            head = TeacherTrainerWrapper(classifier.classifier)
+            train_teacher(dataloader, optimizer, backbone, untrained_backbone, head, teacher, loss_fun, nn.MSELoss(), device, scheduler)
+        elif student_mode:
+            backbone = classifier.backbone
+            for p in classifier.classifier.parameters():
+                p.requires_grad = False
+            student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler)
+        else:
+            train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
 
-        if not unsupervised:
+        if not unsupervised and not teacher_mode:
             validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
 
         epoch += 1
         if save_file_name:
             print(f'Saving checkpoint to file {save_file_name}...')
-            torch.save({
+            save_dict = {
                 'epoch': epoch,
-                'model_state_dict': classifier.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict()
-            }, save_file_name)
+            }
+
+            if teacher_mode:
+                save_dict['teacher_state_dict'] = teacher.state_dict()
+            else:
+                save_dict['model_state_dict'] = classifier.state_dict()
+
+            torch.save(save_dict, save_file_name)
             print('Done saving')
         print(f'Class priors: {dataset.cropper.label_costs}')
 
@@ -378,5 +531,8 @@ if __name__ == "__main__":
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true')
     parser.add_argument('--lock-backbone', dest='lock_backbone', action='store_true')
     parser.add_argument('--only-adapt', dest='only_adapt', action='store_true')
+    parser.add_argument('--teacher-mode', dest='teacher_mode', action='store_true')
+    parser.add_argument('--student-mode', dest='student_mode', action='store_true')
+    parser.add_argument('--load-teacher', dest='load_teacher')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher)
