@@ -1,6 +1,6 @@
 import torch
 import torchvision as tv
-from torchmetrics.classification import MulticlassJaccardIndex
+from torchmetrics.classification import MulticlassConfusionMatrix
 from torch import nn
 from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList, UPCropper
 import argparse
@@ -14,7 +14,6 @@ from lsrmodels import DeeplabNW
 import FeatureModifier as fn
 #import matplotlib.pyplot as plt
 
-BATCH_SIZE = 8
 LEARNING_RATE = 0.00025
 BATCHES_TO_SAVE = 50
 EPOCH_COUNT = 70
@@ -161,11 +160,26 @@ class USSegLoss(nn.Module):
         return self.sq_stat_score(source)
 
 
-def pixel_accuracy(predictions, batch_labels):
-    # Assumes softmax input images
-    predicted_labels = predictions.argmax(dim=1)
-    correct = torch.eq(predicted_labels, batch_labels).int()
-    return float(correct.sum()) / float(correct.numel())
+def pixel_accuracy(confusion_matrix):
+    computed = confusion_matrix.compute()
+    return float(computed.diagonal().sum()) / float(computed.sum())
+
+def IoU(confusion_matrix, ignore_index=0):
+    computed = confusion_matrix.compute()
+    ious = computed.diagonal().clone().to(torch.float)
+    for i in range(ious.numel()):
+        if i == ignore_index:
+            ious[i] = 0.0
+        else:
+            ious[i] = float(ious[i]) / float(computed[i,:].sum() + computed[:,i].sum() - ious[i])
+    return ious
+
+def mIoU(ious, ignore_index=0):
+    if ignore_index == None:
+        return float(ious.sum()) / float(ious.numel())
+
+    ious[ignore_index] = 0.0
+    return float(ious.sum()) / float(ious.numel() - 1)
 
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised=False, lock_backbone=False):
     batch_count = 0
@@ -265,41 +279,27 @@ def student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler):
     total_loss /= float(batch_count)
     print(f'Mean student loss for epoch: {total_loss}')
 
-def validate(dataloader, classifier, device, validation_loss_fun, mIoUGainFun):
+def validate(dataloader, classifier, num_classes, device):
     classifier.eval()
     print('Validating...')
     batch_count = 0
     total_batches = len(dataloader)
-    validation_loss = 0
-    total_mIoU_gain = 0
-    total_classIoU_gain = None
+    confusion_matrix = MulticlassConfusionMatrix(num_classes, ignore_index=0).to(device)
     with torch.no_grad():
         for batch_images, batch_labels in dataloader:
             batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
             predictions = classifier(batch_images)['out']
             normalized_masks = predictions.softmax(dim=1)
-            loss = validation_loss_fun(normalized_masks, batch_labels)
-            mIoUGainFun.average = 'macro'
-            mIoUGain = mIoUGainFun(normalized_masks, batch_labels)
-            mIoUGainFun.average = 'none'
-            classIoUGain = mIoUGainFun(normalized_masks, batch_labels)
-            validation_loss += loss
-            total_mIoU_gain += mIoUGain
-
-            if total_classIoU_gain == None:
-                total_classIoU_gain = classIoUGain
-            else:
-                total_classIoU_gain += classIoUGain
+            confusion_matrix.update(normalized_masks, batch_labels)
 
             if batch_count % 10 == 0:
-                print(f'Validation batch: {batch_count}, Loss: {loss}, mIoU: {mIoUGain}')
+                print(f'Validation batch: {batch_count}, Pixel accuracy so far: {pixel_accuracy(confusion_matrix)}')
             batch_count += 1
-    validation_loss /= float(total_batches)
-    total_mIoU_gain /= float(total_batches)
-    total_classIoU_gain /= float(total_batches)
-    print(f'Validation error: {validation_loss}')
-    print(f'IoU error: {total_mIoU_gain}')
-    print(f'Class IoU errors: {total_classIoU_gain}')
+    ious = IoU(confusion_matrix, ignore_index=0)
+    miou = mIoU(ious, ignore_index=0)
+    print(f'Pixel accuracy: {pixel_accuracy(confusion_matrix)}')
+    print(f'mIoU: {miou}')
+    print(f'Class IoUs: {ious}')
 
 def load_gtav_set(dataset_dir, device='cpu'):
     filelist = GTAVTrainingFileList(dataset_dir, training_split_ratio=0.95)
@@ -326,8 +326,9 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None):
+def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8):
 
+    batch_size = int(batch_size)
     dataset, val_dataset = (None, None)
     loss_weights = None
     if dataset_type == 'gtav':
@@ -343,20 +344,33 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     else:
         raise Exception(f'Unknown dataset type {dataset}')
 
-    dataloader = torch.utils.data.DataLoader(dataset, drop_last=True, batch_size=BATCH_SIZE, shuffle=True)
-    validation_dataloader = torch.utils.data.DataLoader(val_dataset, drop_last=True, batch_size=BATCH_SIZE)
-    mIoU = MulticlassJaccardIndex(num_classes = dataset.COLOR_COUNT, average = 'macro', ignore_index=0).to(device)
+    num_classes = dataset.COLOR_COUNT
+    dataloader = torch.utils.data.DataLoader(dataset, drop_last=True, batch_size=batch_size, shuffle=True)
+    validation_dataloader = torch.utils.data.DataLoader(val_dataset, drop_last=True, batch_size=batch_size)
     print('Dataloader initialized')
     # params 11029075 (mobilenetv3)
     # params 10413651 (DCANet)
-    classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = dataset.COLOR_COUNT)
+
+    classifier = None
+    if model_type == 'rn101':
+        print('Loaded ResNet101 based model')
+        classifier = tv.models.segmentation.deeplabv3_resnet101(num_classes = num_classes)
+    else:
+        print('Loaded ResNet50 based model')
+        classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = num_classes)
     # classifier = DeeplabNW(num_classes = dataset.COLOR_COUNT, backbone='resnet50', pretrained=False)
 
     teacher = None
     untrained_backbone = None
     if teacher_mode:
         print('Initializing teacher network')
-        untrained_backbone = tv.models.segmentation.deeplabv3_resnet50(num_classes = 2048).backbone
+        untrained_backbone = None
+        if model_type == 'rn101':
+            print('Loaded ResNet101 based backbone for teacher training')
+            untrained_backbone = tv.models.segmentation.deeplabv3_resnet101(num_classes = 2048).backbone
+        else:
+            print('Loaded ResNet50 based backbone for teacher training')
+            untrained_backbone = tv.models.segmentation.deeplabv3_resnet50(num_classes = 2048).backbone
         teacher = fn.FeatureModifier()
 
         for p in untrained_backbone.parameters():
@@ -423,7 +437,9 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
     # 10x LR for classifier, 1x for backbone
     optimizer = torch.optim.SGD(optim_params, momentum=0.9, weight_decay=0.0005)
-    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=EPOCH_COUNT * len(dataloader), power=0.9)
+    total_iters = EPOCH_COUNT * EPOCH_LENGTH
+    print(f'Running for total number of iterations of {total_iters}')
+    scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=total_iters, power=0.9)
     epoch = 0
 
     if load_file_name:
@@ -463,9 +479,9 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
     if only_adapt:
         adaptation_filelist = CityscapesValFileList(adaptation_dir)
-        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), drop_last=True, batch_size=BATCH_SIZE)
+        adaptation_dataloader = torch.utils.data.DataLoader(TrafficDataset(adaptation_filelist), drop_last=True, batch_size=batch_size)
         print('== DA Validation ==')
-        validate(adaptation_dataloader, classifier, device, pixel_accuracy, mIoU)
+        validate(adaptation_dataloader, classifier, num_classes, device)
         print('== DA Validation done ==')
         return
     if save_file_name:
@@ -488,7 +504,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
 
         if not unsupervised and not teacher_mode:
-            validate(validation_dataloader, classifier, device, pixel_accuracy, mIoU)
+            validate(validation_dataloader, classifier, num_classes, device)
 
         epoch += 1
         if save_file_name:
@@ -534,5 +550,7 @@ if __name__ == "__main__":
     parser.add_argument('--teacher-mode', dest='teacher_mode', action='store_true')
     parser.add_argument('--student-mode', dest='student_mode', action='store_true')
     parser.add_argument('--load-teacher', dest='load_teacher')
+    parser.add_argument('--model-type', dest='model_type', default='rn50')
+    parser.add_argument('--batch-size', dest='batch_size', default='8')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size)
