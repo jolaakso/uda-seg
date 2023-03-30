@@ -43,6 +43,29 @@ CLASS_COLORS = [
 
 VOID_CLASSES = torch.Tensor([0, 1, 2, 3, 4, 5, 6, 9, 10, 14, 15, 16, 18, 29, 30, 34])
 
+CLASS_LABELS = [
+    'void',
+    'road',
+    'sidewalk',
+    'building',
+    'wall',
+    'fence',
+    'pole',
+    'traffic_light',
+    'traffic_sign',
+    'vegetation',
+    'terrain',
+    'sky',
+    'person',
+    'rider',
+    'car',
+    'truck',
+    'bus',
+    'train',
+    'motorcycle',
+    'bicycle'
+]
+
 VALID_CLASSES = torch.Tensor([
     7,
     8,
