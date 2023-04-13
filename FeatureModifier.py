@@ -11,7 +11,6 @@ class BypassLayer(nn.Module):
         self.bn2 = nn.BatchNorm2d(bn_channels, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
         self.conv3 = nn.Conv2d(bn_channels, channels, kernel_size=(1, 1), stride=(1, 1), bias=False)
         self.bn3 = nn.BatchNorm2d(channels, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
-        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         first_layer = self.conv1(x)
@@ -20,7 +19,7 @@ class BypassLayer(nn.Module):
         second_layer = self.bn2(second_layer)
         x = self.conv3(first_layer + second_layer)
         x = self.bn3(x)
-        return self.relu(x)
+        return x
 
 class FeatureModifier(nn.Module):
     def __init__(self, channels=2048):
@@ -32,12 +31,15 @@ class FeatureModifier(nn.Module):
         self.ds2 = nn.Conv2d(512, 2048, kernel_size=(1, 1), stride=(1, 1), bias=False)
         self.bn2 = nn.BatchNorm2d(2048, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)
         self.neck3 = BypassLayer(2048)
+        self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         first_layer = self.neck1(x)
+        first_layer = self.relu(first_layer)
         x = self.ds1(first_layer)
         x = self.bn1(x)
         x = self.neck2(x)
+        x = self.relu(x)
         x = self.ds2(x)
         x = self.bn2(x)
 

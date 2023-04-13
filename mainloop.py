@@ -10,23 +10,162 @@ from dcanetv2 import DCANetV2
 from BigConv import BigConvBlock
 import random
 import math
+from collections import OrderedDict
 from lsrmodels import DeeplabNW
 import FeatureModifier as fn
 #import matplotlib.pyplot as plt
 
-LEARNING_RATE = 0.00025
+LEARNING_RATE = 0.0025
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 70
+EPOCH_COUNT = 2
 EPOCH_LENGTH = 1000
+
+# Based on torchvision/models/segmentation/_utils.py
+class CovBalancerWrapper(nn.Module):
+    def __init__(self, classifier, device):
+        super().__init__()
+        self.backbone = classifier.backbone
+        self.classifier = classifier.classifier
+        self.cov_layer = CovBalancer2d(2048, device, adapt=False)
+
+    def forward(self, x):
+        input_size = x.shape[-2:]
+        x = self.backbone(x)['out']
+        x = self.cov_layer(x)
+        x = self.classifier(x)
+        x = torch.nn.functional.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+        return { 'out': x }
+
+class CovBalancer2d(nn.Module):
+    def __init__(self, channels, device, convs=5, adapt=False):
+        super().__init__()
+        self.channels = channels
+        self.iterations = nn.parameter.Parameter(torch.zeros(1).to(device), requires_grad=False)
+        self.acc_mean = nn.parameter.Parameter(torch.zeros(1).to(torch.float32).to(device), requires_grad=False)
+        self.acc_cov_matrix = nn.parameter.Parameter(torch.zeros(channels, channels).to(torch.float32).to(device), requires_grad=False)
+        self.convs = nn.ModuleList()
+        for _ in range(convs):
+            conv = nn.Conv2d(channels, channels, kernel_size=(5, 5), groups=channels)
+            conv.requires_grad = False
+            self.convs.append(conv)
+        self.avg_activations = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
+        self.activation_vars = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
+        self.adapt = adapt
+        self.acc_fourier = None
+        self.mse = nn.MSELoss()
+        self.eps = 1e-12
+        self.loss_mode = False
+
+    def get_cov(self):
+        return self.acc_cov_matrix / self.iterations
+
+    def get_fourier(self):
+        return self.acc_fourier / self.iterations
+
+    def get_avg_activation(self):
+        return self.avg_activations / self.iterations
+
+    def get_activation_vars(self):
+        return self.activation_vars / self.iterations
+
+    def get_only_cov(self):
+        cov = self.get_cov()
+        return cov - cov.diag().diag()
+
+    def get_corr(self):
+        cov = self.get_cov()
+        variances = cov.diag().sqrt().unsqueeze(0)
+        cross_variances = variances * variances.T
+        return cov / cross_variances
+
+    def get_mean(self):
+        return self.acc_mean / self.iterations
+
+    def predicted(self, x):
+        corr = self.get_only_cov()
+        chan_means = x.flatten(start_dim=2).mean(dim=2, keepdim=True)
+        return torch.matmul(corr, chan_means)
+
+    def activations(self, x):
+        activation_maps = []
+        for c in self.convs:
+            act = (c(x).mean(dim=3).mean(dim=2) / (x.mean(dim=3).mean(dim=2) + self.eps)).unsqueeze(1)
+            activation_maps.append(act)
+        return torch.cat(activation_maps, 1)
+
+    def loss(self, x):
+        activation_maps = self.activations(x)
+        avgs = activation_maps.mean(0)
+        vars = activation_maps.var(0)
+        avgs_diff = (avgs - self.get_avg_activation()).square().mean()
+
+        return avgs_diff
+
+    def forward(self, x):
+        if self.training and not self.loss_mode:
+            with torch.no_grad():
+                self.iterations.copy_(self.iterations + 1)
+                self.acc_mean.copy_(self.acc_mean + x.mean())
+                self.acc_cov_matrix.copy_(self.acc_cov_matrix + x.flatten(start_dim=2).mean(dim=2).T.cov())
+                activation_maps = self.activations(x)
+                self.avg_activations += activation_maps.mean(0)
+                self.activation_vars += activation_maps.var(0)
+
+        #if self.acc_fourier == None:
+        #    self.acc_fourier = torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
+        #else:
+        #    self.acc_fourier += torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
+
+        if self.adapt:
+            #pred = self.predicted(x).softmax(dim=1).unsqueeze(2)
+            #pred = torch.relu(self.predicted(x))
+            #pred = (pred / (torch.max(pred) + self.eps)).unsqueeze(2)
+            pred = self.predicted(x).unsqueeze(2)
+            batch_mean = x.mean()
+            deficit = self.get_mean() - batch_mean
+            print(f'batch_mean: {batch_mean}')
+            print(f'mean: {self.get_mean()}')
+            print(f'(self.get_mean() / batch_mean): {(self.get_mean() / batch_mean)}')
+            ratio = deficit / pred.mean()
+            appendix = pred * x * ratio
+
+            print(f'activations: {self.avg_acts(x)}')
+            print(f'activation vars: {self.act_vars(x)}')
+            output = x
+            return output
+        return x
 
 class TeacherLoss(nn.Module):
     def __init__(self, teacher):
         super().__init__()
         teacher.eval()
         self.teacher = teacher
+        self.mse = nn.MSELoss()
 
     def forward(self, x):
-        return self.teacher(x).mean()
+        grads = self.teacher(x).detach()
+        diff = nn.functional.relu(x - grads)
+        #diff = self.teacher(x).detach()
+        #return grads.square().mean()
+        return self.mse(x, diff)
+
+class SignLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, preds, labels):
+        ones = torch.ones_like(labels)
+        maximum = labels.abs().max(dim=3, keepdim=True).values.max(dim=2, keepdim=True).values
+        maximum = torch.where(maximum == 0.0, ones, maximum)
+        norm_preds = preds / maximum
+        norm_labels = labels / maximum
+        diff = norm_preds - norm_labels
+        sign_multi = nn.functional.relu(-(norm_preds * norm_labels)).sqrt()
+        penalty = sign_multi * torch.abs(diff).sqrt()
+        losses = penalty + diff.square()
+
+        return losses.mean()
+
 
 # Based on torchvision/models/segmentation/_utils.py
 class TeacherTrainerWrapper(nn.Module):
@@ -164,7 +303,7 @@ def pixel_accuracy(confusion_matrix):
     computed = confusion_matrix.compute()
     return float(computed.diagonal().sum()) / float(computed.sum())
 
-def IoU(confusion_matrix, ignore_index=0):
+def IoU(confusion_matrix, ignore_index=255):
     computed = confusion_matrix.compute()
     ious = computed.diagonal().clone().to(torch.float)
     for i in range(ious.numel()):
@@ -174,12 +313,21 @@ def IoU(confusion_matrix, ignore_index=0):
             ious[i] = float(ious[i]) / float(computed[i,:].sum() + computed[:,i].sum() - ious[i])
     return ious
 
-def mIoU(ious, ignore_index=0):
+def mIoU(ious, ignore_index=255):
     if ignore_index == None:
         return float(ious.sum()) / float(ious.numel())
 
-    ious[ignore_index] = 0.0
+    if ignore_index in range(ious.numel()):
+        ious[ignore_index] = 0.0
     return float(ious.sum()) / float(ious.numel() - 1)
+
+def plot_images_labels(batch_images, batch_labels):
+    f, axarr = plt.subplots(2, batch_images.shape[0])
+    for i in range(batch_images.shape[0]):
+        axarr[0, i].imshow(batch_images[i].permute(1, 2, 0))
+        axarr[1, i].imshow(batch_labels[i])
+
+    plt.show()
 
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised=False, lock_backbone=False):
     batch_count = 0
@@ -188,6 +336,7 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, 
         classifier.backbone.eval()
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
+        #plot_images_labels(batch_images, batch_labels)
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
         predictions = classifier(batch_images)['out']
@@ -217,28 +366,35 @@ def train_teacher(dataloader, optimizer, backbone, dumb_backbone, head, teacher,
     teacher.train()
     head.train()
     backbone.eval()
-    dumb_backbone.eval()
-
-    split_size = dataloader.batch_size // 2
+    dropout = nn.Dropout2d(p=0.5)
+    backbone.get_submodule('layer3').add_module('dropout', dropout)
 
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
+        dropout_chance = random.uniform(0.0, 1.0)
+        if dropout_chance > 0.5:
+            dropout.p = 0.99
+        else:
+            dropout.p = 0.0
+        dropout.training = True
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
-        trained_images, dumb_images = batch_images.split(split_size, dim=0)
-        features = torch.cat((backbone(trained_images)['out'], dumb_backbone(dumb_images)['out']), dim=0)
+        features = backbone(batch_images)['out'].detach().clone()
         features.requires_grad = True
         head_loss_fun(head(features, batch_images.shape[-2:])['out'], batch_labels).backward()
 
-        target_grad = features.grad
+        target_grad = features.grad.detach().clone()
+        preds = teacher(features)
 
-        teacher_loss = teacher_loss_fun(teacher(features), target_grad)
+        if random.randrange(200) == 0:
+            print(f'pred: {preds.flatten(start_dim=1).mean(dim=1)}, true: {target_grad.flatten(start_dim=1).mean(dim=1)}')
+
+        teacher_loss = teacher_loss_fun(preds, target_grad)
         teacher_loss.backward()
 
         # zero to make sure no update on these
         head.zero_grad()
         backbone.zero_grad()
-        dumb_backbone.zero_grad()
         optimizer.step()
 
         if batch_count % 10 == 0:
@@ -255,8 +411,7 @@ def student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler):
     print('Starting student training using teacher')
     batch_count = 0
     backbone.train()
-
-    split_size = dataloader.batch_size // 2
+    ps = []
 
     total_loss = 0
     for ix, (batch_images, _) in enumerate(dataloader):
@@ -266,6 +421,15 @@ def student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler):
 
         loss = loss_fun(features)
         loss.backward()
+
+        #if len(ps) > 0:
+        #    i = 0
+        #    for p in backbone.parameters():
+        #        print(ps[i] - p)
+        #        i += 1
+        #    ps = []
+        #for p in backbone.parameters():
+        #    ps.append(p.detach())
 
         optimizer.step()
 
@@ -284,7 +448,7 @@ def validate(dataloader, classifier, num_classes, device):
     print('Validating...')
     batch_count = 0
     total_batches = len(dataloader)
-    confusion_matrix = MulticlassConfusionMatrix(num_classes, ignore_index=0).to(device)
+    confusion_matrix = MulticlassConfusionMatrix(num_classes, ignore_index=255).to(device)
     with torch.no_grad():
         for batch_images, batch_labels in dataloader:
             batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
@@ -295,8 +459,8 @@ def validate(dataloader, classifier, num_classes, device):
             if batch_count % 10 == 0:
                 print(f'Validation batch: {batch_count}, Pixel accuracy so far: {pixel_accuracy(confusion_matrix)}')
             batch_count += 1
-    ious = IoU(confusion_matrix, ignore_index=0)
-    miou = mIoU(ious, ignore_index=0)
+    ious = IoU(confusion_matrix, ignore_index=255)
+    miou = mIoU(ious, ignore_index=255)
     print(f'Pixel accuracy: {pixel_accuracy(confusion_matrix)}')
     print(f'mIoU: {miou}')
     print(f'Class IoUs: {ious}')
@@ -306,10 +470,10 @@ def load_gtav_set(dataset_dir, device='cpu'):
     val_filelist = GTAVValFileList(dataset_dir, training_split_ratio=0.97)
     assert len(set(filelist) & set(val_filelist)) == 0
     # orig size (704, 1264)?
-    up_cropper = UPCropper(device=device, crop_size=(512, 512), samples=5)
+    up_cropper = UPCropper(device=device, crop_size=(768, 768), samples=1)
 
-    dataset = TrafficDataset(filelist, resize=(720, 1280), train_augmentations=True, cropper=up_cropper, device=device)
-    val_dataset = TrafficDataset(val_filelist, resize=(720, 1280), device=device)
+    dataset = TrafficDataset(filelist, resize=(1052, 1914), train_augmentations=True, cropper=up_cropper, device=device)
+    val_dataset = TrafficDataset(val_filelist, resize=(1052, 1914), device=device)
 
     return dataset, val_dataset
 
@@ -318,15 +482,18 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
     val_filelist = CityscapesValFileList(dataset_dir)
     assert len(set(filelist) & set(val_filelist)) == 0
 
-    up_cropper = UPCropper(device=device, crop_size=(512, 512), samples=1)
+    up_cropper = UPCropper(device=device, crop_size=(768, 768), samples=1)
 
-    dataset = TrafficDataset(filelist, resize=(512, 1024), train_augmentations=True, cropper=up_cropper, device=device)
-    val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), device=device)
+    size = (1024, 2048)
+    print(f'Using cityscapes size {size}')
+
+    dataset = TrafficDataset(filelist, resize=size, train_augmentations=True, cropper=up_cropper, device=device)
+    val_dataset = TrafficDataset(val_filelist, resize=size, device=device)
     #val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8):
+def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8, negative_model=False, cov_layer_adapt=False, cov_layer_loss=False):
 
     batch_size = int(batch_size)
     dataset, val_dataset = (None, None)
@@ -355,6 +522,31 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     if model_type == 'rn101':
         print('Loaded ResNet101 based model')
         classifier = tv.models.segmentation.deeplabv3_resnet101(num_classes = num_classes)
+    elif model_type == 'rn101os16':
+        print('Loaded ResNet101 based model')
+        classifier = tv.models.segmentation.deeplabv3_resnet101(num_classes = num_classes)
+        asps = list(list(list(classifier.classifier.children())[0].children())[0].children())
+
+        asp1 = list(asps[1].children())[0]
+        asp1.padding = (6, 6)
+        asp1.dilation = (6, 6)
+
+        asp2 = list(asps[2].children())[0]
+        asp2.padding = (12, 12)
+        asp2.dilation = (12, 12)
+
+        asp3 = list(asps[3].children())[0]
+        asp3.padding = (18, 18)
+        asp3.dilation = (18, 18)
+
+        print(classifier)
+    elif model_type == 'lsr':
+        print('LSR model loaded with RN101 backbone')
+        classifier = DeeplabNW(num_classes = num_classes, backbone='ResNet101', pretrained=False)
+    elif model_type == 'cov':
+        print('Loaded ResNet50 based model with cov layer')
+        classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = num_classes)
+        classifier = CovBalancerWrapper(classifier, device)
     else:
         print('Loaded ResNet50 based model')
         classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = num_classes)
@@ -362,6 +554,17 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
     teacher = None
     untrained_backbone = None
+
+    if negative_model:
+        if model_type == 'rn101':
+            print('Loaded ResNet101 based backbone for negative model base')
+            untrained_backbone = tv.models.segmentation.deeplabv3_resnet101(num_classes = 2048).backbone
+        else:
+            print('Loaded ResNet50 based backbone for negative model base')
+            untrained_backbone = tv.models.segmentation.deeplabv3_resnet50(num_classes = 2048).backbone
+
+        untrained_backbone = untrained_backbone.to(device)
+
     if teacher_mode:
         print('Initializing teacher network')
         untrained_backbone = None
@@ -387,7 +590,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             raise RuntimeError('--load-teacher needs to be defined in student mode')
 
         print(f'Loading teacher from {load_teacher}')
-        teacher.load_state_dict(torch.load(load_teacher)['teacher_state_dict'])
+        teacher.load_state_dict(torch.load(load_teacher, map_location=torch.device('cpu'))['teacher_state_dict'])
 
         for p in teacher.parameters():
             p.requires_grad = False
@@ -421,17 +624,27 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         loss_fun = USSegLoss()
         optim_params = [{'params': classifier.parameters(), 'lr': LEARNING_RATE }]
     elif lock_backbone:
-        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': 0 },
                         { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
     elif teacher_mode:
-        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': teacher.parameters(), 'lr': 10 * LEARNING_RATE}]
     elif student_mode:
         loss_fun = TeacherLoss(teacher)
         optim_params = [{ 'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE }]
+    elif model_type == 'lsr':
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
+        optim_params = [{'params': classifier.parameters(), 'lr': LEARNING_RATE * 5 }]
+    elif cov_layer_loss:
+        loss_fun = classifier.cov_layer.loss
+        optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE},
+                        {'params': classifier.cov_layer.parameters(), 'lr': 0}]
+    elif model_type == 'cov':
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
+        optim_params = [{'params': classifier.parameters(), 'lr': 0 }]
     else:
-        loss_fun = nn.CrossEntropyLoss(ignore_index=0, weight=loss_weights)
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
                         { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
 
@@ -450,14 +663,26 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         epoch = checkpoint['epoch']
         if teacher_mode and 'teacher_state_dict' in checkpoint:
-            teacher.load_state_dict(checkpoint['teacher'])
+            teacher.load_state_dict(checkpoint['teacher_state_dict'])
         print('Done loading')
+
+    if teacher_mode and load_teacher:
+        print(f'Loading teacher from {load_teacher}')
+        teacher.load_state_dict(torch.load(load_teacher)['teacher_state_dict'])
 
     if load_model:
         print(f'Loading model weights separately from {load_model}')
-        classifier.load_state_dict(torch.load(load_model)['model_state_dict'])
+        if model_type == 'cov':
+            classifier.load_state_dict(torch.load(load_model)['model_state_dict'], strict=False)
+        else:
+            classifier.load_state_dict(torch.load(load_model)['model_state_dict'])
 
-    if load_backbone:
+    if load_backbone and model_type == 'lsr':
+        print(f'Loading backbone weights from pure weights file {load_backbone}')
+        s_dict = torch.load(load_backbone)['state_dict']
+        s_dict = OrderedDict([(k.split('.', 1)[1], v) if k.startswith('module.') else (k, v) for k, v in s_dict.items()])
+        classifier.load_state_dict(s_dict, strict=False)
+    elif load_backbone:
         print(f'Loading backbone weights from {load_backbone}')
         classifier.backbone.load_state_dict(torch.load(load_backbone)['model_state_dict'])
 
@@ -472,6 +697,72 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     #for p in classifier.backbone.parameters():
     #    p.requires_grad = False
     #print('Loaded backbone dict')
+
+    if cov_layer_adapt:
+        print('Switching Cov layer to adapt mode')
+        cov_module = classifier.cov_layer
+        cov_module.adapt = True
+        print(f'cov_module.get_cov()[:10, :10]: {cov_module.get_cov()[:10, :10]}')
+        print(f'cov_module.get_mean(): {cov_module.get_mean()}')
+        print(cov_module.get_avg_activation())
+        print(cov_module.get_activation_vars())
+        def print_feature_stats(module, input, output):
+            out = output
+
+            #print(cov[:10,:10])
+            #print(predicted[:, :10])
+            #print(out.flatten(start_dim=2).mean(dim=2)[:, :10])
+            #print(predicted.softmax(dim=1)[:, :10])
+            #print(out.flatten(start_dim=2).mean(dim=2).softmax(dim=1)[:, :10])
+            #print(cov_module.get_mean())
+            #vals = output['out']
+            #print(f'vals.shape: {vals.shape}')
+            print(f'out.mean(): {out.mean()}')
+            #print(f'predicted.mean(): {predicted.mean()}')
+            #print(f'predicted.flatten(start_dim=1).mean(dim=1): {predicted.flatten(start_dim=1).mean(dim=1)}')
+            #print(f'out.flatten(start_dim=1).mean(dim=1): {out.flatten(start_dim=1).mean(dim=1)}')
+            #print(f'vals.flatten(start_dim=2).var(dim=2).mean(): {vals.flatten(start_dim=2).var(dim=2).mean()}')
+            #print(f'vals.flatten(start_dim=2).mean(dim=2).var(dim=1).mean(): {vals.flatten(start_dim=2).mean(dim=2).var(dim=1).mean()}')
+
+        #classifier.backbone.load_state_dict(model_params)
+        cov_module.register_forward_hook(print_feature_stats)
+
+
+    if negative_model:
+        #default_params = untrained_backbone.state_dict()
+        #model_params = classifier.backbone.state_dict()
+
+        #for name, param in default_params.items():
+        #    if not "weight" in name:
+        #        continue
+        #    model_param = model_params[name]
+        #    model_params[name] = -(model_param - param) + param
+
+        classifier.backbone.add_module('cov', CovBalancer2d(2048, device, adapt=True))
+
+        print('(actually normal model)')
+        def print_feature_stats(module, input, output):
+            out = output['out']
+            cov_module = module.get_submodule('cov')
+            cov = cov_module.get_cov()
+            predicted = cov_module.predicted(out).flatten(start_dim=1)
+            print(cov[:10,:10])
+            print(predicted[:, :10])
+            print(out.flatten(start_dim=2).mean(dim=2)[:, :10])
+            print(predicted.softmax(dim=1)[:, :10])
+            print(out.flatten(start_dim=2).mean(dim=2).softmax(dim=1)[:, :10])
+            print(cov_module.get_mean())
+            #vals = output['out']
+            #print(f'vals.shape: {vals.shape}')
+            print(f'out.mean(): {out.mean()}')
+            print(f'predicted.mean(): {predicted.mean()}')
+            print(f'predicted.flatten(start_dim=1).mean(dim=1): {predicted.flatten(start_dim=1).mean(dim=1)}')
+            print(f'out.flatten(start_dim=1).mean(dim=1): {out.flatten(start_dim=1).mean(dim=1)}')
+            #print(f'vals.flatten(start_dim=2).var(dim=2).mean(): {vals.flatten(start_dim=2).var(dim=2).mean()}')
+            #print(f'vals.flatten(start_dim=2).mean(dim=2).var(dim=1).mean(): {vals.flatten(start_dim=2).mean(dim=2).var(dim=1).mean()}')
+
+        #classifier.backbone.load_state_dict(model_params)
+        classifier.backbone.register_forward_hook(print_feature_stats)
 
     print('Network initialized')
 
@@ -494,13 +785,21 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             for p in backbone.parameters():
                 p.requires_grad = False
             head = TeacherTrainerWrapper(classifier.classifier)
-            train_teacher(dataloader, optimizer, backbone, untrained_backbone, head, teacher, loss_fun, nn.MSELoss(), device, scheduler)
+            train_teacher(dataloader, optimizer, backbone, untrained_backbone, head, teacher, loss_fun, SignLoss(), device, scheduler)
         elif student_mode:
             backbone = classifier.backbone
             for p in classifier.classifier.parameters():
                 p.requires_grad = False
             student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler)
-        else:
+        elif cov_layer_loss:
+            print('Using cov layer loss')
+            backbone = classifier.backbone
+            classifier.cov_layer.train()
+            classifier.cov_layer.loss_mode = True
+            for p in classifier.classifier.parameters():
+                p.requires_grad = False
+            student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler)
+        elif not negative_model:
             train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
 
         if not unsupervised and not teacher_mode:
@@ -552,5 +851,8 @@ if __name__ == "__main__":
     parser.add_argument('--load-teacher', dest='load_teacher')
     parser.add_argument('--model-type', dest='model_type', default='rn50')
     parser.add_argument('--batch-size', dest='batch_size', default='8')
+    parser.add_argument('--negative-model', dest='negative_model', action='store_true')
+    parser.add_argument('--cov-layer-adapt', dest='cov_layer_adapt', action='store_true')
+    parser.add_argument('--cov-layer-loss', dest='cov_layer_loss', action='store_true')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size, args.negative_model, args.cov_layer_adapt, args.cov_layer_loss)

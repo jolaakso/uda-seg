@@ -156,40 +156,48 @@ class GTAVValFileList(GTAVTrainingFileList):
     def __len__(self):
         return len(self.validation_names)
 
-class CityscapesValFileList():
+class CityscapesFileList():
     def __init__(self, path):
         self.path = path
-        self.imagespath = os.path.join(path, 'leftImg8bit/')
-        self.labelspath = os.path.join(path, 'gtFine/')
-        self.image_names = glob.glob(f'{self.imagespath}/val/*/*.png')
-        self.label_names = glob.glob(f'{self.labelspath}/val/*/*_labelIds.png')
+        self.imagespath = os.path.join(path, 'leftImg8bit')
+        self.labelspath = os.path.join(path, 'gtFine')
+        self.image_names = glob.glob(f'{self.imagespath}/{self.midpath()}/*/*.png')
+        # self.label_names = glob.glob(f'{self.labelspath}/{self.midpath()}/*/*_labelIds.png')
 
     def __getitem__(self, i):
-        return (self.image_names[i], self.label_names[i])
+        # leftImg8bit/train/hamburg/hamburg_000000_104857_leftImg8bit.png
+        # gtFine/train/hamburg/hamburg_000000_104857_gtFine_labelIds.png
+        image_name = self.image_names[i]
+        base_name = os.path.basename(image_name)
+        city_name = base_name.split('_', 1)[0]
+        image_common_part = base_name.rpartition('_')[0]
+        label_name = f'{self.labelspath}/{self.midpath()}/{city_name}/{image_common_part}_gtFine_labelIds.png'
+        return (image_name, label_name)
+
+    def midpath(self):
+        raise NotImplementedError()
 
     def __len__(self):
         images_len = len(self.image_names)
-        assert(images_len == len(self.label_names))
         return images_len
 
-class CityscapesTrainFileList():
-    def __init__(self, path):
-        self.path = path
-        self.imagespath = os.path.join(path, 'leftImg8bit/')
-        self.labelspath = os.path.join(path, 'gtFine/')
-        self.image_names = glob.glob(f'{self.imagespath}/train/*/*.png')
-        self.label_names = glob.glob(f'{self.labelspath}/train/*/*_labelIds.png')
+class CityscapesValFileList(CityscapesFileList):
+    def midpath(self):
+        return 'val'
 
-    def __getitem__(self, i):
-        return (self.image_names[i], self.label_names[i])
+class CityscapesTrainFileList(CityscapesFileList):
+    def midpath(self):
+        return 'train'
 
-    def __len__(self):
-        images_len = len(self.image_names)
-        assert(images_len == len(self.label_names))
-        return images_len
+def apply_to_img_and_label(image, label_image, operation):
+    mod_image, mod_label_image = torch.split(operation(torch.cat((image, label_image), 0)), (3, 1), 0)
+    mod_label_image = mod_label_image.to(label_image.dtype)
+
+    return mod_image, mod_label_image
+
 
 class UPCropper(torch.nn.Module):
-    def __init__(self, crop_size=(720, 1280), samples=1, ignore_label=0, label_count=20, label_costs=None, device='cpu'):
+    def __init__(self, crop_size=(720, 1280), samples=1, ignore_label=255, label_count=19, label_costs=None, device='cpu'):
         super().__init__()
         self.crop = tv.transforms.RandomCrop(crop_size)
         self.samples = samples
@@ -202,17 +210,16 @@ class UPCropper(torch.nn.Module):
 
     def likelihood(self, label_image):
         labels_histogram = torch.bincount(label_image.flatten(), minlength=self.label_count).to(torch.float32)
-        labels_histogram[self.ignore_label] = 0
-        labels_distribution = torch.nn.functional.normalize(labels_histogram, p=1, dim=0)
+        if self.ignore_label in range(labels_histogram.numel()):
+            labels_histogram[self.ignore_label] = 0
+        labels_distribution = torch.nn.functional.normalize(labels_histogram, p=1, dim=0)[:self.label_count]
         normalized_label_costs = torch.nn.functional.normalize(self.label_costs, p=1, dim=0)
         cost = (normalized_label_costs * labels_distribution).sum()
 
         return cost, labels_distribution
 
     def crop_randomly(self, image, label_image):
-        cropped_image, cropped_label_image = torch.split(self.crop(torch.cat((image, label_image), 0)), (3, 1), 0)
-        cropped_label_image = cropped_label_image.to(label_image.dtype)
-        return cropped_image, cropped_label_image
+        return apply_to_img_and_label(image, label_image, self.crop)
 
     def forward(self, image, label_image):
         if self.samples < 1:
@@ -235,9 +242,19 @@ class UPCropper(torch.nn.Module):
 
         return best_image, best_label_image, best_cost
 
+class ColorRandomizer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.white_sampler = torch.distributions.uniform.Uniform(0.77, 1.417)
+        self.shift_sampler = torch.distributions.uniform.Uniform(-0.1, 0.1)
+
+    def forward(self, x):
+        new_white = self.white_sampler.sample((3, 1, 1)).to(x.device).to(x.dtype)
+        color_shift = self.shift_sampler.sample((3, 1, 1)).to(x.device).to(x.dtype)
+        return x * new_white + color_shift
 
 class TrafficDataset(torch.utils.data.Dataset):
-    COLOR_COUNT = 20
+    COLOR_COUNT = 19
     TOTAL_COLOR_COUNT = 35
 
     def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu', include_label_cost=False):
@@ -250,10 +267,12 @@ class TrafficDataset(torch.utils.data.Dataset):
         self.train_augmentations = train_augmentations
         if train_augmentations:
             self.augmentations = tv.transforms.Compose([
-                tv.transforms.RandomHorizontalFlip(),
-                tv.transforms.ColorJitter(0.1, 0.1, 0.1, 0.1),
+                tv.transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
+                ColorRandomizer(),
                 tv.transforms.GaussianBlur(5, sigma=(0.01, 1.0))
             ])
+
+            self.common_augs = tv.transforms.RandomHorizontalFlip()
         self.cropper = None
         if cropper:
             self.cropper = cropper
@@ -266,7 +285,10 @@ class TrafficDataset(torch.utils.data.Dataset):
     def nullify_voids(self, label_image):
         original_shape = label_image.shape
         nulled = torch.index_select(self.used_class_names, 0, label_image.flatten()).reshape(original_shape)
-        # 0 as the void class
+        # -1 as void class
+        nulled = nulled - 1
+        # 255 as void class
+        nulled = torch.where(nulled == -1, 255, nulled)
         return nulled
 
     def __getitem__(self, i):
@@ -284,6 +306,7 @@ class TrafficDataset(torch.utils.data.Dataset):
             image, label_image, cost = self.cropper(image, label_image)
         if self.train_augmentations:
             image = self.augmentations(image)
+            image, label_image = apply_to_img_and_label(image, label_image, self.common_augs)
         image = self.normalize_colors(image)
 
         if self.cropper and self.include_label_cost:
