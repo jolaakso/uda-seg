@@ -189,6 +189,18 @@ class CityscapesTrainFileList(CityscapesFileList):
     def midpath(self):
         return 'train'
 
+class CityscapesTrainExtraFileList(CityscapesTrainFileList):
+    def __init__(self, path):
+        super().__init__(path)
+        train_image_paths = glob.glob(f'{self.imagespath}/{super().midpath()}/*/*.png')
+        self.image_names = train_image_paths + self.image_names
+
+    def __getitem__(self, i):
+        return (self.image_names[i], None)
+
+    def midpath(self):
+        return 'train_extra'
+
 def apply_to_img_and_label(image, label_image, operation):
     mod_image, mod_label_image = torch.split(operation(torch.cat((image, label_image), 0)), (3, 1), 0)
     mod_label_image = mod_label_image.to(label_image.dtype)
@@ -224,6 +236,9 @@ class UPCropper(torch.nn.Module):
     def forward(self, image, label_image):
         if self.samples < 1:
             raise RuntimeException(f'samples {self.samples} < 1')
+        elif self.samples == 1:
+            image, label_image = self.crop_randomly(image, label_image)
+            return image, label_image, None
 
         best_image, best_label_image = self.crop_randomly(image, label_image)
         best_cost, best_distribution = self.likelihood(best_label_image)
@@ -257,7 +272,7 @@ class TrafficDataset(torch.utils.data.Dataset):
     COLOR_COUNT = 19
     TOTAL_COLOR_COUNT = 35
 
-    def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu', include_label_cost=False):
+    def __init__(self, filelist, resize=(720, 1280), cropper=None, train_augmentations=False, device='cpu', include_label_cost=False, allow_missing_labels=False):
         super().__init__()
         self.device = device
         self.img_resize = tv.transforms.Resize(resize, interpolation=tv.transforms.InterpolationMode.BICUBIC)
@@ -278,6 +293,7 @@ class TrafficDataset(torch.utils.data.Dataset):
             self.cropper = cropper
         self.used_class_names = USED_CLASS_NAMES.to(device)
         self.include_label_cost = include_label_cost
+        self.allow_missing_labels = allow_missing_labels
 
     def __len__(self):
         return len(self.filelist)
@@ -293,8 +309,15 @@ class TrafficDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         image_path, label_path = self.filelist[i]
-        image = tv.io.image.read_image(image_path).to(self.device)
-        label_image = tv.io.image.read_image(label_path).to(self.device)
+        image = tv.io.image.read_image(image_path, tv.io.ImageReadMode.RGB).to(self.device)
+        label_image = None
+        if label_path != None:
+            label_image = tv.io.image.read_image(label_path).to(self.device)
+        elif self.allow_missing_labels:
+            label_image = torch.zeros_like(image)[0, :, :].unsqueeze(0)
+
+        if not self.allow_missing_labels and label_image == None:
+            raise ValueError(f'label_image is None, but allow_missing_labels is set to {self.allow_missing_labels}')
         # crop from same place randomly
         image = self.img_resize(image)
         label_image = self.label_resize(label_image)

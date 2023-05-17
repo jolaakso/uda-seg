@@ -2,7 +2,7 @@ import torch
 import torchvision as tv
 from torchmetrics.classification import MulticlassConfusionMatrix
 from torch import nn
-from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList, UPCropper
+from gtaloader import TrafficDataset, GTAVTrainingFileList, GTAVValFileList, CityscapesValFileList, CityscapesTrainFileList, CityscapesTrainExtraFileList, UPCropper
 import argparse
 import sys
 from acc_conv import AccConv2d
@@ -13,12 +13,199 @@ import math
 from collections import OrderedDict
 from lsrmodels import DeeplabNW
 import FeatureModifier as fn
+from FourierNormalization2d import FourierNormalization2d
 #import matplotlib.pyplot as plt
 
-LEARNING_RATE = 0.0025
+LEARNING_RATE = 0.00025
 BATCHES_TO_SAVE = 50
-EPOCH_COUNT = 2
+EPOCH_COUNT = 20
 EPOCH_LENGTH = 1000
+
+class ZeroLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return (x * 0.0).sum() * 0.0
+
+class SmoothMaxLoss(nn.Module):
+    def __init__(self, alpha=1/128):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        _, _, height, width = x.shape
+        distributions = x.softmax(dim=1)
+        return (1 - (distributions / self.alpha).logsumexp(dim=1) * self.alpha).mean()
+
+class NeighborLoss(nn.Module):
+    def __init__(self, channels, device, neighbor_weight=0.5):
+        super().__init__()
+        self.channels = channels
+        self.current_weight = 1 - neighbor_weight
+        self.kernel = torch.ones((channels, 1, 3, 3), device=device)
+        self.kernel[:, :, :, :] = neighbor_weight / 8.0
+        self.kernel[:, :, 1, 1] = 0
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        maxes, maxinds = distributions.max(dim=1, keepdim=True)
+        max_indicators = torch.zeros_like(distributions).scatter(1, maxinds, 1.0)
+        multiplier = -1.0/2.0
+        mixed = torch.nn.functional.conv2d(max_indicators * maxes, self.kernel, padding=1, groups=self.channels)
+        mixed += distributions * self.current_weight
+        squares = multiplier * mixed.square()
+        return squares.mean()
+
+class WeighedMaxLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        _, indices = distributions.max(dim=1, keepdim=True)
+        class_means = 1 - distributions.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True).detach().clone()
+        balance_factor = class_means.mean()
+        return torch.gather(-distributions * class_means, 1, indices).mean() / balance_factor
+
+class LogLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.eps = 1e-12
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1) + self.eps
+        return -distributions.log().mean()
+
+class ExpMaxLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        return -(distributions.max(dim=1).values.exp()).mean()
+
+class LogMaxLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        return -(distributions.max(dim=1).values.log()).mean()
+
+class SquaresMaxLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.maxloss = MaxLoss()
+        self.sqloss = SquaresLoss()
+
+    def forward(self, x):
+        return (self.maxloss(x) + self.sqloss(x)) / 2
+
+class BatchAdaptiveLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.eps = 1e-12
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        class_avgs = distributions.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True)
+        class_avgs = coerce_to_unit(class_avgs)
+
+        return -(0.5 * distributions.square() * class_avgs + (distributions + self.eps).log() * (1 - class_avgs)).mean()
+
+class MeanDistLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.eps = 1e-12
+
+    def forward(self, x):
+        _, channels, _, _ = x.shape
+        distributions = x.softmax(dim=1)
+        return -torch.nn.functional.relu(distributions - (1.0/channels)).mean()
+
+class NormalLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        _, channels, _, _ = x.shape
+        distributions = x.softmax(dim=1)
+        return ((distributions / distributions.max(dim=1, keepdim=True).values).mean(dim=1) - 1).mean()
+
+class MaxLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        return (1 - distributions.max(dim=1).values).mean()
+
+class Top2DiffLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        top2 = distributions.topk(2, dim=1, sorted=False).values
+        multiplier = -0.5
+        return multiplier * (top2[:, 0, :, :] - top2[:, 1, :, :]).abs().mean()
+
+class Top2SquareDiffLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        distributions = x.softmax(dim=1)
+        top2 = distributions.topk(2, dim=1, sorted=False).values
+        multiplier = -0.5
+        return multiplier * (top2[:, 0, :, :] - top2[:, 1, :, :]).square().mean()
+
+class SquaresLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        _, _, height, width = x.shape
+        multiplier = -0.5
+        distributions = x.softmax(dim=1)
+        squares = multiplier * distributions.square().sum(dim=1)
+        return squares.mean()
+
+class EntropyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.eps = 1e-12
+
+    def forward(self, x):
+        _, classes, _, _ = x.shape
+        log_classes = math.log(classes * 1.0)
+        multiplier = -1.0 / log_classes
+        distributions = x.softmax(dim=1)
+        entropies = 1 + multiplier * (distributions * (distributions + self.eps).log()).sum(dim=1)
+        return entropies.mean()
+
+class InvertibleConvolution(nn.Module):
+    def __init__(self, channels, device, kernel_size=(2, 2), padding=1):
+        super().__init__()
+        self.upper_left = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
+        self.lower_right = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
+        self.translate_kernel = torch.tensor([[0, 0], [0, 1]], device=device)
+
+    def forward(self, x):
+        return x
+
+class StaticDropout2d(nn.Module):
+    def __init__(self, channels, p=0.5):
+        super().__init__()
+        self.channels = channels
+        self.p = p
+
+    def forward(self, x):
+        if self.training:
+            mask = torch.bernoulli(torch.ones(1, self.channels, 1, 1, device=x.device) * (1 - self.p))
+            return x * mask
+        return x
 
 # Based on torchvision/models/segmentation/_utils.py
 class CovBalancerWrapper(nn.Module):
@@ -144,10 +331,10 @@ class TeacherLoss(nn.Module):
 
     def forward(self, x):
         grads = self.teacher(x).detach()
-        diff = nn.functional.relu(x - grads)
+        diff = nn.functional.relu(x - grads).detach().clone()
         #diff = self.teacher(x).detach()
         #return grads.square().mean()
-        return self.mse(x, diff)
+        return self.mse(x, diff) / 2.0
 
 class SignLoss(nn.Module):
     def __init__(self):
@@ -297,7 +484,34 @@ class USSegLoss(nn.Module):
 
     def forward(self, source):
         return self.sq_stat_score(source)
+        #return source.mean() * 0.0
 
+def coerce_to_unit(distribution):
+    maxx = distribution.max(dim=1, keepdim=True).values
+    minn = distribution.min(dim=1, keepdim=True).values
+
+    return (distribution - minn) / (maxx - minn)
+
+def mix_samples(images, predictions):
+    distributions = predictions.softmax(dim=1)
+    _, maxinds = distributions.max(dim=1, keepdim=True)
+    #print(maxinds[0, :, :10, :10])
+    #print(maxinds[1, :, :10, :10])
+    max_indicators = torch.zeros_like(predictions).scatter(1, maxinds, 1.0)
+    class_means = 1 - max_indicators.mean(dim=3, keepdim=True).mean(dim=2, keepdim=True).mean(dim=0, keepdim=True).detach().clone()
+    #print(max_indicators[0, :, :10, :10])
+    #print(class_means)
+    permutation = [*range(1, distributions.shape[0]), 0]
+    label_indices = max_indicators + max_indicators[permutation, :, :, :]
+    _, label_indices = (label_indices * class_means).max(dim=1)
+    masks = (max_indicators * class_means).sum(dim=1, keepdim=True) > (max_indicators[permutation, :, :, :] * class_means).sum(dim=1, keepdim=True)
+    #images = (images + images[permutation, :, :, :]) / 2
+    images = images * masks + images[permutation, :, :, :] * masks.logical_not()
+
+    #print(label_indices[0, :10, :10])
+    # torch.zeros_like(a).scatter(1, maxinds, 1.0)
+    # rotate = a[:,[-1, *range(0, dims - 1)] , :, :,]
+    return (images, label_indices)
 
 def pixel_accuracy(confusion_matrix):
     computed = confusion_matrix.compute()
@@ -360,22 +574,66 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, 
     total_loss /= float(batch_count)
     print(f'Mean training loss for epoch: {total_loss}')
 
+def train_unsupervised_end_to_end(dataloader, us_dataloader, optimizer, classifier, loss_fun, unsuperv_loss_fun, device, scheduler, lam=0.001, self_train=False):
+    print(f'Training end to end with unsupervised loss {unsuperv_loss_fun.__class__.__name__}, lambda={lam}')
+    self_train_lam = 0.1
+    if self_train:
+        print(f'Using self training with self_train_lambda={self_train_lam}')
+    batch_count = 0
+    classifier.train()
+    total_loss = 0
+    dl_len = len(dataloader)
+    udl_len = len(us_dataloader)
+    dl_enum = enumerate(dataloader)
+    udl_enum = enumerate(us_dataloader)
+    for i in range(min(dl_len, udl_len, EPOCH_LENGTH)):
+        optimizer.zero_grad()
+        ix, (batch_images, batch_labels) = next(dl_enum)
+            #plot_images_labels(batch_images, batch_labels)
+        batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
+        predictions = classifier(batch_images)['out']
+
+        superv_loss = loss_fun(predictions, batch_labels)
+
+        ix, (batch_images, _) = next(udl_enum)
+        batch_images = batch_images.to(device)
+        predictions = classifier(batch_images)['out']
+
+        loss = superv_loss + lam * unsuperv_loss_fun(predictions)
+
+        if self_train:
+            batch_images, batch_labels = mix_samples(batch_images, predictions)
+            predictons = classifier(batch_images)['out']
+            loss += self_train_lam * loss_fun(predictions, batch_labels)
+        loss.backward()
+        optimizer.step()
+        if batch_count % 10 == 0:
+            print(f'Training unsupervised e2e batch (unsuperv loss): {batch_count}, Loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
+                #plt.imshow(predictions[0][0].detach().numpy())
+                #plt.show()
+        total_loss += loss.item()
+        batch_count += 1
+        scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
+    total_loss /= float(batch_count)
+    print(f'Mean training loss for epoch (unsupervised e2e): {total_loss}')
+
 def train_teacher(dataloader, optimizer, backbone, dumb_backbone, head, teacher, head_loss_fun, teacher_loss_fun, device, scheduler):
     print('Starting teacher training.')
     batch_count = 0
     teacher.train()
     head.train()
     backbone.eval()
-    dropout = nn.Dropout2d(p=0.5)
+    dropout = StaticDropout2d(1024, p=0.5).to(device)
+    sampler = torch.distributions.beta.Beta(0.15, 0.15)
     backbone.get_submodule('layer3').add_module('dropout', dropout)
 
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
-        dropout_chance = random.uniform(0.0, 1.0)
-        if dropout_chance > 0.5:
-            dropout.p = 0.99
-        else:
-            dropout.p = 0.0
+        sample = sampler.sample()
+        chance_value = torch.min(sample, torch.ones_like(sample) * 0.99)
+        dropout.p = chance_value
         dropout.training = True
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
@@ -443,6 +701,17 @@ def student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler):
     total_loss /= float(batch_count)
     print(f'Mean student loss for epoch: {total_loss}')
 
+def fourier_stats_run(dataloader, fourier_layer, device):
+    fourier_layer.train()
+    batch_count = 0
+    for batch_images, _ in dataloader:
+        batch_images = batch_images.to(device)
+        fourier_layer(batch_images)
+        if batch_count % 10 == 0:
+            print(f'Fourier stats batch {batch_count}')
+        batch_count += 1
+    print('Fourier stats ran for epoch')
+
 def validate(dataloader, classifier, num_classes, device):
     classifier.eval()
     print('Validating...')
@@ -480,6 +749,9 @@ def load_gtav_set(dataset_dir, device='cpu'):
 def load_cityscapes_set(dataset_dir, device='cpu'):
     filelist = CityscapesTrainFileList(dataset_dir)
     val_filelist = CityscapesValFileList(dataset_dir)
+    #print(len(filelist))
+    #for f in filelist:
+    #    print(f[0])
     assert len(set(filelist) & set(val_filelist)) == 0
 
     up_cropper = UPCropper(device=device, crop_size=(768, 768), samples=1)
@@ -493,7 +765,26 @@ def load_cityscapes_set(dataset_dir, device='cpu'):
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8, negative_model=False, cov_layer_adapt=False, cov_layer_loss=False):
+def load_cityscapes_unsupervised_set(dataset_dir, device='cpu'):
+    filelist = CityscapesTrainExtraFileList(dataset_dir)
+    val_filelist = CityscapesValFileList(dataset_dir)
+    #print(len(filelist))
+    #for f in filelist:
+    #    print(f[0])
+    assert len(set(filelist) & set(val_filelist)) == 0
+
+    up_cropper = UPCropper(device=device, crop_size=(768, 768), samples=1)
+
+    size = (1024, 2048)
+    print(f'Using cityscapes size {size}')
+
+    dataset = TrafficDataset(filelist, resize=size, train_augmentations=True, cropper=up_cropper, device=device, allow_missing_labels=True)
+    val_dataset = TrafficDataset(val_filelist, resize=size, device=device)
+    #val_dataset = TrafficDataset(val_filelist, resize=(512, 1024), crop_size=(512, 1024))
+
+    return dataset, val_dataset
+
+def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8, negative_model=False, cov_layer_adapt=False, cov_layer_loss=False, init_fourier=False, fourier_stats=False, add_fourier=False, load_init_fourier=None, us_e2e_loss=None, us_dataset_dir=None, us_dataset_type=None, us_lambda=0.001, us_self_train=False):
 
     batch_size = int(batch_size)
     dataset, val_dataset = (None, None)
@@ -509,7 +800,31 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         dataset, val_dataset = load_cityscapes_set(dataset_dir)
         print(f'Loaded Cityscapes dataset at {dataset_dir}')
     else:
-        raise Exception(f'Unknown dataset type {dataset}')
+        raise Exception(f'Unknown dataset type {dataset_type}')
+
+    us_dataset, us_val_dataset = (None, None)
+    us_dataloader, us_validation_dataloader = (None, None)
+    if us_dataset_dir and us_dataset_type:
+        if us_dataset_type == 'gtav':
+            us_dataset, us_val_dataset = load_gtav_set(us_dataset_dir, device=device)
+        #loss_weights = torch.Tensor([0.0, 2.7346e+00, 1.0929e+01, 5.3414e+00, 4.7041e+01, 1.3804e+02,
+        #                             8.5594e+01, 6.6778e+02, 1.0664e+03, 1.1754e+01, 4.1259e+01, 6.5842e+00,
+        #                             2.4710e+02, 3.0451e+03, 3.4462e+01, 7.5414e+01, 2.4990e+02, 1.4041e+03,
+        #                             2.7946e+03, 1.7960e+04]).to(device)
+            print(f'Loaded GTAV dataset at {us_dataset_dir} for unsupervised')
+        elif us_dataset_type == 'cityscapes':
+            us_dataset, us_val_dataset = load_cityscapes_unsupervised_set(us_dataset_dir)
+            if model_type == 'rn50':
+                print('Loading cityscapes supervised instead for smaller model')
+                us_dataset, us_val_dataset = load_cityscapes_set(us_dataset_dir)
+            print(f'Loaded Cityscapes dataset at {us_dataset_dir} for unsupervised')
+        else:
+            raise Exception(f'Unknown dataset type {us_dataset_type} for unsupervised')
+
+        us_dataloader = torch.utils.data.DataLoader(us_dataset, drop_last=True, batch_size=batch_size, shuffle=True)
+        us_validation_dataloader = torch.utils.data.DataLoader(us_val_dataset, drop_last=True, batch_size=batch_size)
+
+        print(f'Dataloaders initialized for unsupervised (type {us_dataset_type})')
 
     num_classes = dataset.COLOR_COUNT
     dataloader = torch.utils.data.DataLoader(dataset, drop_last=True, batch_size=batch_size, shuffle=True)
@@ -551,6 +866,10 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         print('Loaded ResNet50 based model')
         classifier = tv.models.segmentation.deeplabv3_resnet50(num_classes = num_classes)
     # classifier = DeeplabNW(num_classes = dataset.COLOR_COUNT, backbone='resnet50', pretrained=False)
+
+    if add_fourier:
+        print('Adding Fourier layer')
+        classifier.backbone = nn.Sequential(FourierNormalization2d(3, 256, 256).to(device), classifier.backbone)
 
     teacher = None
     untrained_backbone = None
@@ -597,7 +916,6 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
         teacher = teacher.to(device)
 
-
     if unsupervised:
         classifier = classifier.backbone
     #classifier.classifier[0] = nn.Sequential(
@@ -618,6 +936,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         epoch_batches = min(EPOCH_LENGTH, len(dataloader))
 
     loss_fun = None
+    unsuperv_loss_fun = None
     optim_params = []
 
     if unsupervised:
@@ -629,7 +948,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
                         { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
     elif teacher_mode:
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
-        optim_params = [{'params': teacher.parameters(), 'lr': 10 * LEARNING_RATE}]
+        optim_params = [{'params': teacher.parameters(), 'lr': 500 * LEARNING_RATE}]
     elif student_mode:
         loss_fun = TeacherLoss(teacher)
         optim_params = [{ 'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE }]
@@ -643,6 +962,44 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     elif model_type == 'cov':
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.parameters(), 'lr': 0 }]
+    elif us_e2e_loss:
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
+        optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
+                        { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
+        if us_e2e_loss == 'entropy':
+            unsuperv_loss_fun = EntropyLoss()
+        elif us_e2e_loss == 'squares':
+            unsuperv_loss_fun = SquaresLoss()
+        elif us_e2e_loss == 'meandist':
+            unsuperv_loss_fun = MeanDistLoss()
+        elif us_e2e_loss == 'max':
+            unsuperv_loss_fun = MaxLoss()
+        elif us_e2e_loss == 'squaresmax':
+            unsuperv_loss_fun = SquaresMaxLoss()
+        elif us_e2e_loss == 'smoothmax':
+            unsuperv_loss_fun = SmoothMaxLoss()
+        elif us_e2e_loss == 'neighbor':
+            unsuperv_loss_fun = NeighborLoss(num_classes, device)
+        elif us_e2e_loss == 'weightedmax':
+            unsuperv_loss_fun = WeighedMaxLoss()
+        elif us_e2e_loss == 'batchadaptive':
+            unsuperv_loss_fun = BatchAdaptiveLoss()
+        elif us_e2e_loss == 'logmax':
+            unsuperv_loss_fun = LogMaxLoss()
+        elif us_e2e_loss == 'expmax':
+            unsuperv_loss_fun = ExpMaxLoss()
+        elif us_e2e_loss == 'top2diff':
+            unsuperv_loss_fun = Top2DiffLoss()
+        elif us_e2e_loss == 'top2squarediff':
+            unsuperv_loss_fun = Top2SquareDiffLoss()
+        elif us_e2e_loss == 'normal':
+            unsuperv_loss_fun = NormalLoss()
+        elif us_e2e_loss == 'log':
+            unsuperv_loss_fun = LogLoss()
+        elif us_e2e_loss == 'zero':
+            unsuperv_loss_fun = ZeroLoss()
+        else:
+            raise ValueError(f'Unrecognized unsupervised loss "{us_e2e_loss}"')
     else:
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
@@ -674,8 +1031,15 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         print(f'Loading model weights separately from {load_model}')
         if model_type == 'cov':
             classifier.load_state_dict(torch.load(load_model)['model_state_dict'], strict=False)
+        elif unsupervised:
+            print(f'Loading model weights in unsupervised mode')
+            s_dict = []
+            for k, v in torch.load(load_model)['model_state_dict'].items():
+                if k.startswith('backbone.'):
+                    s_dict.append((k.split('.', 1)[1], v))
+            classifier.load_state_dict(OrderedDict(s_dict))
         else:
-            classifier.load_state_dict(torch.load(load_model)['model_state_dict'])
+            classifier.load_state_dict(torch.load(load_model, map_location=device)['model_state_dict'])
 
     if load_backbone and model_type == 'lsr':
         print(f'Loading backbone weights from pure weights file {load_backbone}')
@@ -763,6 +1127,21 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
         #classifier.backbone.load_state_dict(model_params)
         classifier.backbone.register_forward_hook(print_feature_stats)
+    if init_fourier:
+        print('Initializing Fourier layer')
+        classifier.backbone = nn.Sequential(FourierNormalization2d(3, 20, 20).to(device), classifier.backbone)
+    elif load_init_fourier:
+        print(f'Initializing Fourier layer from {load_init_fourier}')
+        fourier_norm = FourierNormalization2d(3, 100, 100).to(device)
+        fourier_norm.load_state_dict(torch.load(load_init_fourier, map_location=device))
+        fourier_norm.width = 20
+        fourier_norm.height = 20
+        classifier.backbone = nn.Sequential(fourier_norm, classifier.backbone)
+
+    fourier_layer_only = None
+    if fourier_stats:
+        print('Getting fourier stats')
+        fourier_layer_only = FourierNormalization2d(3, 100, 100).to(device)
 
     print('Network initialized')
 
@@ -774,6 +1153,14 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
         print('== DA Validation ==')
         validate(adaptation_dataloader, classifier, num_classes, device)
         print('== DA Validation done ==')
+        return
+    if fourier_stats:
+        while epoch < EPOCH_COUNT:
+            fourier_stats_run(dataloader, fourier_layer_only, device)
+
+            print(f'saving to {save_file_name}')
+            torch.save(fourier_layer_only.state_dict(), save_file_name)
+            epoch += 1
         return
     if save_file_name:
         print(f'Will save the checkpoint every epoch to {save_file_name}')
@@ -799,6 +1186,8 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             for p in classifier.classifier.parameters():
                 p.requires_grad = False
             student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler)
+        elif us_e2e_loss:
+            train_unsupervised_end_to_end(dataloader, us_dataloader, optimizer, classifier, loss_fun, unsuperv_loss_fun, device, scheduler, lam=us_lambda, self_train=us_self_train)
         elif not negative_model:
             train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
 
@@ -840,7 +1229,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', dest='dataset_dir')
     parser.add_argument('--dataset-type', dest='dataset_type')
     parser.add_argument('--adaptset', dest='adaptset_dir')
-    parser.add_argument('--device', dest='device')
+    parser.add_argument('--device', dest='device', default='cpu')
     parser.add_argument('--load-backbone', dest='load_backbone')
     parser.add_argument('--load-model', dest='load_model')
     parser.add_argument('--unsupervised', dest='unsupervised', action='store_true')
@@ -854,5 +1243,14 @@ if __name__ == "__main__":
     parser.add_argument('--negative-model', dest='negative_model', action='store_true')
     parser.add_argument('--cov-layer-adapt', dest='cov_layer_adapt', action='store_true')
     parser.add_argument('--cov-layer-loss', dest='cov_layer_loss', action='store_true')
+    parser.add_argument('--init-fourier', dest='init_fourier', action='store_true')
+    parser.add_argument('--fourier-stats', dest='fourier_stats', action='store_true')
+    parser.add_argument('--add-fourier', dest='add_fourier', action='store_true')
+    parser.add_argument('--load-init-fourier', dest='load_init_fourier')
+    parser.add_argument('--us-dataset', dest='us_dataset_dir')
+    parser.add_argument('--us-dataset-type', dest='us_dataset_type')
+    parser.add_argument('--us-e2e-loss', dest='us_e2e_loss')
+    parser.add_argument('--us-lambda', dest='us_lambda', type=float, default=0.001)
+    parser.add_argument('--us-self-train', dest='us_self_train', action='store_true')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size, args.negative_model, args.cov_layer_adapt, args.cov_layer_loss)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size, args.negative_model, args.cov_layer_adapt, args.cov_layer_loss, args.init_fourier, args.fourier_stats, args.add_fourier, args.load_init_fourier, args.us_e2e_loss, args.us_dataset_dir, args.us_dataset_type, args.us_lambda, args.us_self_train)
