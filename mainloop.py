@@ -13,7 +13,7 @@ import math
 from collections import OrderedDict
 from lsrmodels import DeeplabNW
 import FeatureModifier as fn
-from FourierNormalization2d import FourierNormalization2d
+#from FourierNormalization2d import FourierNormalization2d
 #import matplotlib.pyplot as plt
 
 LEARNING_RATE = 0.00025
@@ -28,24 +28,24 @@ class ZeroLoss(nn.Module):
     def forward(self, x):
         return (x * 0.0).sum() * 0.0
 
-class SmoothMaxLoss(nn.Module):
-    def __init__(self, alpha=1/128):
-        super().__init__()
-        self.alpha = alpha
-
-    def forward(self, x):
-        _, _, height, width = x.shape
-        distributions = x.softmax(dim=1)
-        return (1 - (distributions / self.alpha).logsumexp(dim=1) * self.alpha).mean()
-
-class NeighborLoss(nn.Module):
-    def __init__(self, channels, device, neighbor_weight=0.5):
-        super().__init__()
-        self.channels = channels
-        self.current_weight = 1 - neighbor_weight
-        self.kernel = torch.ones((channels, 1, 3, 3), device=device)
-        self.kernel[:, :, :, :] = neighbor_weight / 8.0
-        self.kernel[:, :, 1, 1] = 0
+# class SmoothMaxLoss(nn.Module):
+#     def __init__(self, alpha=1/128):
+#         super().__init__()
+#         self.alpha = alpha
+#
+#     def forward(self, x):
+#         _, _, height, width = x.shape
+#         distributions = x.softmax(dim=1)
+#         return (1 - (distributions / self.alpha).logsumexp(dim=1) * self.alpha).mean()
+#
+# class NeighborLoss(nn.Module):
+#     def __init__(self, channels, device, neighbor_weight=0.5):
+#         super().__init__()
+#         self.channels = channels
+#         self.current_weight = 1 - neighbor_weight
+#         self.kernel = torch.ones((channels, 1, 3, 3), device=device)
+#         self.kernel[:, :, :, :] = neighbor_weight / 8.0
+#         self.kernel[:, :, 1, 1] = 0
 
     def forward(self, x):
         distributions = x.softmax(dim=1)
@@ -185,15 +185,15 @@ class EntropyLoss(nn.Module):
         entropies = 1 + multiplier * (distributions * (distributions + self.eps).log()).sum(dim=1)
         return entropies.mean()
 
-class InvertibleConvolution(nn.Module):
-    def __init__(self, channels, device, kernel_size=(2, 2), padding=1):
-        super().__init__()
-        self.upper_left = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
-        self.lower_right = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
-        self.translate_kernel = torch.tensor([[0, 0], [0, 1]], device=device)
-
-    def forward(self, x):
-        return x
+# class InvertibleConvolution(nn.Module):
+#     def __init__(self, channels, device, kernel_size=(2, 2), padding=1):
+#         super().__init__()
+#         self.upper_left = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
+#         self.lower_right = nn.Conv2d(channels, channels, kernel_size=kernel_size, groups=channels, padding=1)
+#         self.translate_kernel = torch.tensor([[0, 0], [0, 1]], device=device)
+#
+#     def forward(self, x):
+#         return x
 
 class StaticDropout2d(nn.Module):
     def __init__(self, channels, p=0.5):
@@ -207,120 +207,120 @@ class StaticDropout2d(nn.Module):
             return x * mask
         return x
 
-# Based on torchvision/models/segmentation/_utils.py
-class CovBalancerWrapper(nn.Module):
-    def __init__(self, classifier, device):
-        super().__init__()
-        self.backbone = classifier.backbone
-        self.classifier = classifier.classifier
-        self.cov_layer = CovBalancer2d(2048, device, adapt=False)
+# # Based on torchvision/models/segmentation/_utils.py
+# class CovBalancerWrapper(nn.Module):
+#     def __init__(self, classifier, device):
+#         super().__init__()
+#         self.backbone = classifier.backbone
+#         self.classifier = classifier.classifier
+#         self.cov_layer = CovBalancer2d(2048, device, adapt=False)
+#
+#     def forward(self, x):
+#         input_size = x.shape[-2:]
+#         x = self.backbone(x)['out']
+#         x = self.cov_layer(x)
+#         x = self.classifier(x)
+#         x = torch.nn.functional.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
+#         return { 'out': x }
 
-    def forward(self, x):
-        input_size = x.shape[-2:]
-        x = self.backbone(x)['out']
-        x = self.cov_layer(x)
-        x = self.classifier(x)
-        x = torch.nn.functional.interpolate(x, size=input_size, mode='bilinear', align_corners=False)
-        return { 'out': x }
-
-class CovBalancer2d(nn.Module):
-    def __init__(self, channels, device, convs=5, adapt=False):
-        super().__init__()
-        self.channels = channels
-        self.iterations = nn.parameter.Parameter(torch.zeros(1).to(device), requires_grad=False)
-        self.acc_mean = nn.parameter.Parameter(torch.zeros(1).to(torch.float32).to(device), requires_grad=False)
-        self.acc_cov_matrix = nn.parameter.Parameter(torch.zeros(channels, channels).to(torch.float32).to(device), requires_grad=False)
-        self.convs = nn.ModuleList()
-        for _ in range(convs):
-            conv = nn.Conv2d(channels, channels, kernel_size=(5, 5), groups=channels)
-            conv.requires_grad = False
-            self.convs.append(conv)
-        self.avg_activations = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
-        self.activation_vars = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
-        self.adapt = adapt
-        self.acc_fourier = None
-        self.mse = nn.MSELoss()
-        self.eps = 1e-12
-        self.loss_mode = False
-
-    def get_cov(self):
-        return self.acc_cov_matrix / self.iterations
-
-    def get_fourier(self):
-        return self.acc_fourier / self.iterations
-
-    def get_avg_activation(self):
-        return self.avg_activations / self.iterations
-
-    def get_activation_vars(self):
-        return self.activation_vars / self.iterations
-
-    def get_only_cov(self):
-        cov = self.get_cov()
-        return cov - cov.diag().diag()
-
-    def get_corr(self):
-        cov = self.get_cov()
-        variances = cov.diag().sqrt().unsqueeze(0)
-        cross_variances = variances * variances.T
-        return cov / cross_variances
-
-    def get_mean(self):
-        return self.acc_mean / self.iterations
-
-    def predicted(self, x):
-        corr = self.get_only_cov()
-        chan_means = x.flatten(start_dim=2).mean(dim=2, keepdim=True)
-        return torch.matmul(corr, chan_means)
-
-    def activations(self, x):
-        activation_maps = []
-        for c in self.convs:
-            act = (c(x).mean(dim=3).mean(dim=2) / (x.mean(dim=3).mean(dim=2) + self.eps)).unsqueeze(1)
-            activation_maps.append(act)
-        return torch.cat(activation_maps, 1)
-
-    def loss(self, x):
-        activation_maps = self.activations(x)
-        avgs = activation_maps.mean(0)
-        vars = activation_maps.var(0)
-        avgs_diff = (avgs - self.get_avg_activation()).square().mean()
-
-        return avgs_diff
-
-    def forward(self, x):
-        if self.training and not self.loss_mode:
-            with torch.no_grad():
-                self.iterations.copy_(self.iterations + 1)
-                self.acc_mean.copy_(self.acc_mean + x.mean())
-                self.acc_cov_matrix.copy_(self.acc_cov_matrix + x.flatten(start_dim=2).mean(dim=2).T.cov())
-                activation_maps = self.activations(x)
-                self.avg_activations += activation_maps.mean(0)
-                self.activation_vars += activation_maps.var(0)
-
-        #if self.acc_fourier == None:
-        #    self.acc_fourier = torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
-        #else:
-        #    self.acc_fourier += torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
-
-        if self.adapt:
-            #pred = self.predicted(x).softmax(dim=1).unsqueeze(2)
-            #pred = torch.relu(self.predicted(x))
-            #pred = (pred / (torch.max(pred) + self.eps)).unsqueeze(2)
-            pred = self.predicted(x).unsqueeze(2)
-            batch_mean = x.mean()
-            deficit = self.get_mean() - batch_mean
-            print(f'batch_mean: {batch_mean}')
-            print(f'mean: {self.get_mean()}')
-            print(f'(self.get_mean() / batch_mean): {(self.get_mean() / batch_mean)}')
-            ratio = deficit / pred.mean()
-            appendix = pred * x * ratio
-
-            print(f'activations: {self.avg_acts(x)}')
-            print(f'activation vars: {self.act_vars(x)}')
-            output = x
-            return output
-        return x
+# class CovBalancer2d(nn.Module):
+#     def __init__(self, channels, device, convs=5, adapt=False):
+#         super().__init__()
+#         self.channels = channels
+#         self.iterations = nn.parameter.Parameter(torch.zeros(1).to(device), requires_grad=False)
+#         self.acc_mean = nn.parameter.Parameter(torch.zeros(1).to(torch.float32).to(device), requires_grad=False)
+#         self.acc_cov_matrix = nn.parameter.Parameter(torch.zeros(channels, channels).to(torch.float32).to(device), requires_grad=False)
+#         self.convs = nn.ModuleList()
+#         for _ in range(convs):
+#             conv = nn.Conv2d(channels, channels, kernel_size=(5, 5), groups=channels)
+#             conv.requires_grad = False
+#             self.convs.append(conv)
+#         self.avg_activations = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
+#         self.activation_vars = nn.parameter.Parameter(torch.zeros(convs, 2048).to(device), requires_grad=False)
+#         self.adapt = adapt
+#         self.acc_fourier = None
+#         self.mse = nn.MSELoss()
+#         self.eps = 1e-12
+#         self.loss_mode = False
+#
+#     def get_cov(self):
+#         return self.acc_cov_matrix / self.iterations
+#
+#     def get_fourier(self):
+#         return self.acc_fourier / self.iterations
+#
+#     def get_avg_activation(self):
+#         return self.avg_activations / self.iterations
+#
+#     def get_activation_vars(self):
+#         return self.activation_vars / self.iterations
+#
+#     def get_only_cov(self):
+#         cov = self.get_cov()
+#         return cov - cov.diag().diag()
+#
+#     def get_corr(self):
+#         cov = self.get_cov()
+#         variances = cov.diag().sqrt().unsqueeze(0)
+#         cross_variances = variances * variances.T
+#         return cov / cross_variances
+#
+#     def get_mean(self):
+#         return self.acc_mean / self.iterations
+#
+#     def predicted(self, x):
+#         corr = self.get_only_cov()
+#         chan_means = x.flatten(start_dim=2).mean(dim=2, keepdim=True)
+#         return torch.matmul(corr, chan_means)
+#
+#     def activations(self, x):
+#         activation_maps = []
+#         for c in self.convs:
+#             act = (c(x).mean(dim=3).mean(dim=2) / (x.mean(dim=3).mean(dim=2) + self.eps)).unsqueeze(1)
+#             activation_maps.append(act)
+#         return torch.cat(activation_maps, 1)
+#
+#     def loss(self, x):
+#         activation_maps = self.activations(x)
+#         avgs = activation_maps.mean(0)
+#         vars = activation_maps.var(0)
+#         avgs_diff = (avgs - self.get_avg_activation()).square().mean()
+#
+#         return avgs_diff
+#
+#     def forward(self, x):
+#         if self.training and not self.loss_mode:
+#             with torch.no_grad():
+#                 self.iterations.copy_(self.iterations + 1)
+#                 self.acc_mean.copy_(self.acc_mean + x.mean())
+#                 self.acc_cov_matrix.copy_(self.acc_cov_matrix + x.flatten(start_dim=2).mean(dim=2).T.cov())
+#                 activation_maps = self.activations(x)
+#                 self.avg_activations += activation_maps.mean(0)
+#                 self.activation_vars += activation_maps.var(0)
+#
+#         #if self.acc_fourier == None:
+#         #    self.acc_fourier = torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
+#         #else:
+#         #    self.acc_fourier += torch.fft.rfft2(x).mean(dim=1).mean(dim=0)
+#
+#         if self.adapt:
+#             #pred = self.predicted(x).softmax(dim=1).unsqueeze(2)
+#             #pred = torch.relu(self.predicted(x))
+#             #pred = (pred / (torch.max(pred) + self.eps)).unsqueeze(2)
+#             pred = self.predicted(x).unsqueeze(2)
+#             batch_mean = x.mean()
+#             deficit = self.get_mean() - batch_mean
+#             print(f'batch_mean: {batch_mean}')
+#             print(f'mean: {self.get_mean()}')
+#             print(f'(self.get_mean() / batch_mean): {(self.get_mean() / batch_mean)}')
+#             ratio = deficit / pred.mean()
+#             appendix = pred * x * ratio
+#
+#             print(f'activations: {self.avg_acts(x)}')
+#             print(f'activation vars: {self.act_vars(x)}')
+#             output = x
+#             return output
+#         return x
 
 class TeacherLoss(nn.Module):
     def __init__(self, teacher):
@@ -353,6 +353,19 @@ class SignLoss(nn.Module):
 
         return losses.mean()
 
+class KinkedLoss(nn.Module):
+    def __init__(self, slope_penalty=math.e):
+        super().__init__()
+        self.slope_penalty = slope_penalty
+
+    def forward(self, x, y):
+        signs = torch.tanh(y * self.slope_penalty)
+        preds = x * signs
+        targets = y * signs
+        diff = targets - preds
+        inner_max = torch.maximum(diff, (self.slope_penalty * diff) + (targets - (self.slope_penalty * targets)))
+        outer_max = torch.maximum(-self.slope_penalty * diff, inner_max)
+        return (outer_max - targets).mean()
 
 # Based on torchvision/models/segmentation/_utils.py
 class TeacherTrainerWrapper(nn.Module):
@@ -543,6 +556,15 @@ def plot_images_labels(batch_images, batch_labels):
 
     plt.show()
 
+def to_one_hot(indices, device, classes=19, ignore_index=255):
+    #print(indices.shape)
+    batch_size, height, width = indices.shape
+    indices[indices == ignore_index] = classes
+    one_hot = torch.zeros(batch_size, classes+1, height, width, device=device).to(torch.float32)
+    #print(one_hot.shape)
+
+    return one_hot.scatter(1, indices.unsqueeze(1), 1.0)[:, :-1, :, :]
+
 def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised=False, lock_backbone=False):
     batch_count = 0
     classifier.train()
@@ -566,6 +588,67 @@ def train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, 
             print(f'Training batch: {batch_count}, Loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
             #plt.imshow(predictions[0][0].detach().numpy())
             #plt.show()
+        total_loss += loss.item()
+        batch_count += 1
+        scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
+    total_loss /= float(batch_count)
+    print(f'Mean training loss for epoch: {total_loss}')
+
+def train_reverse(dataloader, optimizer, classifier, reverser, loss_fun, device, scheduler, ignore_index=255):
+    batch_count = 0
+    classifier.eval()
+    reverser.train()
+    dataloader.train_augmentations = False
+    softmax = nn.Softmax(dim=1)
+    total_loss = 0
+    for ix, (batch_images, _) in enumerate(dataloader):
+        #plot_images_labels(batch_images, batch_labels)
+        optimizer.zero_grad()
+        batch_images = batch_images.to(device)
+        pred_maps = None
+        with torch.no_grad():
+            pred_maps = softmax(classifier(batch_images)['out'])
+        predictions = reverser(pred_maps)
+
+        loss = loss_fun(predictions, batch_images)
+
+        loss.backward()
+        optimizer.step()
+        if batch_count % 10 == 0:
+            print(f'Reverse training batch: {batch_count}, Loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
+        total_loss += loss.item()
+        batch_count += 1
+        scheduler.step()
+        if EPOCH_LENGTH and batch_count >= EPOCH_LENGTH:
+            break
+    total_loss /= float(batch_count)
+    print(f'Mean reverse training loss for epoch: {total_loss}')
+
+def train_augment_reverse(dataloader, optimizer, classifier, reverser, loss_fun, device, scheduler, aug_weight=0.1, noise_factor=0.2, ignore_index=255):
+    batch_count = 0
+    classifier.train()
+    reverser.eval()
+    softmax = nn.Softmax(dim=1)
+    dataloader.train_augmentations = False
+    total_loss = 0
+    for ix, (batch_images, batch_labels) in enumerate(dataloader):
+        #plot_images_labels(batch_images, batch_labels)
+        optimizer.zero_grad()
+        batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
+        reversed = None
+        with torch.no_grad():
+            pred_maps = softmax(classifier(batch_images)['out'])
+            reversed = reverser(pred_maps)
+        classifier.zero_grad()
+        predictions = classifier(aug_weight * reversed + (1 - aug_weight) * batch_images)['out']
+        loss = loss_fun(predictions, batch_labels)
+
+        loss.backward()
+        optimizer.step()
+        if batch_count % 10 == 0:
+            print(f'Training batch (reverse aug): {batch_count}, Loss: {loss.item()}, learning rate: {scheduler.get_last_lr()}')
         total_loss += loss.item()
         batch_count += 1
         scheduler.step()
@@ -625,24 +708,24 @@ def train_teacher(dataloader, optimizer, backbone, dumb_backbone, head, teacher,
     teacher.train()
     head.train()
     backbone.eval()
-    dropout = StaticDropout2d(1024, p=0.5).to(device)
-    sampler = torch.distributions.beta.Beta(0.15, 0.15)
-    backbone.get_submodule('layer3').add_module('dropout', dropout)
+    dumb_backbone.eval()
 
     total_loss = 0
     for ix, (batch_images, batch_labels) in enumerate(dataloader):
-        sample = sampler.sample()
-        chance_value = torch.min(sample, torch.ones_like(sample) * 0.99)
-        dropout.p = chance_value
-        dropout.training = True
         optimizer.zero_grad()
         batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
-        features = backbone(batch_images)['out'].detach().clone()
+        features = None
+        if random.random() < 0.5:
+            features = backbone(batch_images)['out'].detach().clone()
+        else:
+            features = dumb_backbone(batch_images)['out'].detach().clone()
         features.requires_grad = True
         head_loss_fun(head(features, batch_images.shape[-2:])['out'], batch_labels).backward()
 
         target_grad = features.grad.detach().clone()
         preds = teacher(features)
+        target_grad_magnitude = target_grad.abs().mean()
+        target_grad = target_grad / target_grad_magnitude
 
         if random.randrange(200) == 0:
             print(f'pred: {preds.flatten(start_dim=1).mean(dim=1)}, true: {target_grad.flatten(start_dim=1).mean(dim=1)}')
@@ -653,6 +736,7 @@ def train_teacher(dataloader, optimizer, backbone, dumb_backbone, head, teacher,
         # zero to make sure no update on these
         head.zero_grad()
         backbone.zero_grad()
+        dumb_backbone.zero_grad()
         optimizer.step()
 
         if batch_count % 10 == 0:
@@ -784,7 +868,7 @@ def load_cityscapes_unsupervised_set(dataset_dir, device='cpu'):
 
     return dataset, val_dataset
 
-def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8, negative_model=False, cov_layer_adapt=False, cov_layer_loss=False, init_fourier=False, fourier_stats=False, add_fourier=False, load_init_fourier=None, us_e2e_loss=None, us_dataset_dir=None, us_dataset_type=None, us_lambda=0.001, us_self_train=False):
+def start(save_file_name=None, load_file_name=None, load_backbone=None, load_model=None, dataset_type='gtav', dataset_dir='../datasetit/gtav/', adaptation_dir='../datasetit/cityscapes/', device='cpu', only_adapt=False, unsupervised=False, lock_backbone=False, teacher_mode=False, student_mode=False, load_teacher=None, model_type='rn50', batch_size=8, negative_model=False, cov_layer_adapt=False, cov_layer_loss=False, init_fourier=False, fourier_stats=False, add_fourier=False, load_init_fourier=None, us_e2e_loss=None, us_dataset_dir=None, us_dataset_type=None, us_lambda=0.001, us_self_train=False, reverse_mode_train=False, load_reverser=None, train_with_reverser=False):
 
     batch_size = int(batch_size)
     dataset, val_dataset = (None, None)
@@ -884,6 +968,18 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
         untrained_backbone = untrained_backbone.to(device)
 
+    reverser = None
+
+    if reverse_mode_train or train_with_reverser:
+        print('Initializing reverse mode network')
+        reverser = fn.FeatureModifier(in_channels=19, out_channels=3, sum_initial_layer=False).to(device)
+        dataset.train_augmentations = False
+        us_dataset.train_augmentations = False
+
+        if load_reverser:
+            print(f'Loading reverser from {load_reverser}')
+            reverser.load_state_dict(torch.load(load_reverser, map_location=device)['reverser_state_dict'])
+
     if teacher_mode:
         print('Initializing teacher network')
         untrained_backbone = None
@@ -948,7 +1044,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
                         { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
     elif teacher_mode:
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
-        optim_params = [{'params': teacher.parameters(), 'lr': 500 * LEARNING_RATE}]
+        optim_params = [{'params': teacher.parameters(), 'lr': LEARNING_RATE}]
     elif student_mode:
         loss_fun = TeacherLoss(teacher)
         optim_params = [{ 'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE }]
@@ -962,6 +1058,13 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
     elif model_type == 'cov':
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.parameters(), 'lr': 0 }]
+    elif reverse_mode_train:
+        loss_fun = nn.MSELoss()
+        optim_params = [{'params': reverser.parameters(), 'lr': LEARNING_RATE }]
+    elif train_with_reverser:
+        loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
+        optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
+                        { 'params': classifier.classifier.parameters(), 'lr': 10 * LEARNING_RATE }]
     elif us_e2e_loss:
         loss_fun = nn.CrossEntropyLoss(ignore_index=255, weight=loss_weights)
         optim_params = [{'params': classifier.backbone.parameters(), 'lr': LEARNING_RATE },
@@ -1172,7 +1275,7 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             for p in backbone.parameters():
                 p.requires_grad = False
             head = TeacherTrainerWrapper(classifier.classifier)
-            train_teacher(dataloader, optimizer, backbone, untrained_backbone, head, teacher, loss_fun, SignLoss(), device, scheduler)
+            train_teacher(dataloader, optimizer, backbone, untrained_backbone, head, teacher, loss_fun, KinkedLoss(), device, scheduler)
         elif student_mode:
             backbone = classifier.backbone
             for p in classifier.classifier.parameters():
@@ -1188,10 +1291,13 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
             student_train(dataloader, optimizer, backbone, loss_fun, device, scheduler)
         elif us_e2e_loss:
             train_unsupervised_end_to_end(dataloader, us_dataloader, optimizer, classifier, loss_fun, unsuperv_loss_fun, device, scheduler, lam=us_lambda, self_train=us_self_train)
+        elif reverse_mode_train:
+            train_reverse(us_dataloader, optimizer, classifier, reverser, loss_fun, device, scheduler)
+        elif train_with_reverser:
+            train_augment_reverse(dataloader, optimizer, classifier, reverser, loss_fun, device, scheduler)
         elif not negative_model:
             train_epoch(dataloader, optimizer, classifier, loss_fun, device, scheduler, unsupervised, lock_backbone)
-
-        if not unsupervised and not teacher_mode:
+        if not unsupervised and not teacher_mode and not reverse_mode_train:
             validate(validation_dataloader, classifier, num_classes, device)
 
         epoch += 1
@@ -1205,6 +1311,8 @@ def start(save_file_name=None, load_file_name=None, load_backbone=None, load_mod
 
             if teacher_mode:
                 save_dict['teacher_state_dict'] = teacher.state_dict()
+            elif reverse_mode_train:
+                save_dict['reverser_state_dict'] = reverser.state_dict()
             else:
                 save_dict['model_state_dict'] = classifier.state_dict()
 
@@ -1252,5 +1360,8 @@ if __name__ == "__main__":
     parser.add_argument('--us-e2e-loss', dest='us_e2e_loss')
     parser.add_argument('--us-lambda', dest='us_lambda', type=float, default=0.001)
     parser.add_argument('--us-self-train', dest='us_self_train', action='store_true')
+    parser.add_argument('--reverse-mode-train', dest='reverse_mode_train', action='store_true')
+    parser.add_argument('--load-reverser', dest='load_reverser')
+    parser.add_argument('--train-with-reverser', dest='train_with_reverser', action='store_true')
     args = parser.parse_args()
-    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size, args.negative_model, args.cov_layer_adapt, args.cov_layer_loss, args.init_fourier, args.fourier_stats, args.add_fourier, args.load_init_fourier, args.us_e2e_loss, args.us_dataset_dir, args.us_dataset_type, args.us_lambda, args.us_self_train)
+    start(args.save_file_name, args.load_file_name, args.load_backbone, args.load_model, args.dataset_type, args.dataset_dir, args.adaptset_dir, args.device, args.only_adapt, args.unsupervised, args.lock_backbone, args.teacher_mode, args.student_mode, args.load_teacher, args.model_type, args.batch_size, args.negative_model, args.cov_layer_adapt, args.cov_layer_loss, args.init_fourier, args.fourier_stats, args.add_fourier, args.load_init_fourier, args.us_e2e_loss, args.us_dataset_dir, args.us_dataset_type, args.us_lambda, args.us_self_train, args.reverse_mode_train, args.load_reverser, args.train_with_reverser)
